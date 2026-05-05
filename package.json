@@ -6,10 +6,10 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "discord.js": "^14.14.1",
-    "express": "^4.18.2",
-    "socket.io": "^4.7.4"
+    "cors": "^2.8.6",
+    "discord.js": "^14.26.4",
+    "express": "^4.22.1",
+    "socket.io": "^4.8.3"
   },
   "description": "API Bob Notifier com HWID, Anti-Dualhook e WebSocket",
   "repository": {
