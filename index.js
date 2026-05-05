@@ -13,7 +13,11 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 let keys = {}; 
 
 const client = new Client({ 
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
+    intents: [
+        GatewayIntentBits.Guilds, 
+        GatewayIntentBits.GuildMessages, 
+        GatewayIntentBits.MessageContent // ESSENCIAL PARA LER COMANDOS
+    ] 
 });
 
 const formatTime = (ms) => {
@@ -22,76 +26,65 @@ const formatTime = (ms) => {
     return `${h}h ${m}m ${s}s`;
 };
 
-// --- COMANDOS DISCORD (PAINEL DE CONTROLE) ---
+// --- PAINEL DE CONTROLE PELO DISCORD ---
 client.on("messageCreate", async (msg) => {
     if (msg.author.bot || msg.channel.id !== LOG_CHANNEL_ID) return;
+    
     const args = msg.content.split(" ");
     const cmd = args[0].toLowerCase();
 
-    // 1. LISTAR CHAVES (!info)
+    // !info - Listar tudo
     if (cmd === "!info") {
         let list = "";
-        let count = 0;
         for (let k in keys) {
             const rem = keys[k].paused ? keys[k].timeLeftMs : keys[k].expires - Date.now();
             if (rem > 0 || keys[k].paused) {
-                count++;
                 list += `**Key:** \`${k}\` | ${keys[k].paused ? "⏸️" : "✅"} | ${formatTime(rem)}\n`;
             }
         }
-        const embed = new EmbedBuilder()
-            .setTitle("🔑 Painel de Chaves")
-            .setDescription(count > 0 ? list : "Nenhuma chave ativa.")
-            .setColor(0x0099FF).setTimestamp();
-        msg.reply({ embeds: [embed] });
+        msg.reply(list === "" ? "Nenhuma chave ativa." : "### 🔑 Painel de Controle:\n" + list);
     }
 
-    // 2. CRIAR CHAVE (!create <h> <m> [key])
+    // !create <h> <m> [key] - Criar chave
     if (cmd === "!create") {
         const h = parseFloat(args[1] || 0), m = parseFloat(args[2] || 0);
         let k = args[3] || "BOB-" + Math.random().toString(36).substring(2, 10).toUpperCase();
         const ms = (h * 3600000) + (m * 60000);
-        if (ms <= 0) return msg.reply("❌ Defina um tempo válido.");
         keys[k] = { expires: Date.now() + ms, paused: false, timeLeftMs: ms };
-        msg.reply(`✅ **Chave Criada:** \`${k}\` por ${formatTime(ms)}`);
+        msg.reply(`✅ **Criada:** \`${k}\` por ${formatTime(ms)}`);
     }
 
-    // 3. REVOGAR CHAVE (!revoke <key>)
+    // !revoke <key> - Deletar chave
     if (cmd === "!revoke") {
         const k = args[1];
-        if (keys[k]) {
-            delete keys[k];
-            msg.reply(`🗑️ **Chave Revogada:** \`${k}\` foi removida.`);
-        } else msg.reply("❌ Chave não encontrada.");
+        if (keys[k]) { delete keys[k]; msg.reply(`🗑️ **Revogada:** \`${k}\``); }
+        else msg.reply("❌ Não encontrada.");
     }
 
-    // 4. PAUSAR CHAVE (!pause <key>)
+    // !pause <key> - Pausar/Despausar
     if (cmd === "!pause") {
         const k = args[1];
-        if (!keys[k]) return msg.reply("❌ Chave não encontrada.");
+        if (!keys[k]) return msg.reply("❌ Não encontrada.");
         if (!keys[k].paused) {
             keys[k].paused = true;
             keys[k].timeLeftMs = keys[k].expires - Date.now();
-            msg.reply(`⏸️ **Chave Pausada:** \`${k}\``);
+            msg.reply(`⏸️ **Pausada:** \`${k}\``);
         } else {
             keys[k].paused = false;
             keys[k].expires = Date.now() + keys[k].timeLeftMs;
-            msg.reply(`▶️ **Chave Despausada:** \`${k}\``);
+            msg.reply(`▶️ **Despausada:** \`${k}\``);
         }
     }
 
-    // 5. COMPENSAR TEMPO (!compensate <minutos>)
+    // !compensate <minutos> - Adicionar tempo global
     if (cmd === "!compensate") {
         const mins = parseFloat(args[1]);
         if (isNaN(mins)) return msg.reply("❌ Use: `!compensate <minutos>`");
-        const addMs = mins * 60000;
-        let count = 0;
         for (let k in keys) {
-            if (keys[k].paused) keys[k].timeLeftMs += addMs;
-            else keys[k].expires += addMs;
-            count++;
+            if (keys[k].paused) keys[k].timeLeftMs += (mins * 60000);
+            else keys[k].expires += (mins * 60000);
         }
-        msg.reply(`🎁 **Compensação:** +${mins}m adicionados a ${count} chaves.`);
+        msg.reply(`🎁 **Compensação:** +${mins}m para todos.`);
     }
 });
 
@@ -105,19 +98,15 @@ const io = new Server(server, { cors: { origin: "*" } });
 app.get("/validate", (req, res) => {
     const { key, secret } = req.query;
     if (secret !== SCRIPT_SECRET) return res.json({ status: "error", message: "Anti-Dualhook" });
-    if (!keys[key]) return res.json({ status: "error", message: "Inexistente" });
+    if (!keys[key]) return res.json({ status: "error" });
     if (keys[key].paused) return res.json({ status: "error", message: "Pausada" });
     if (Date.now() > keys[key].expires) { delete keys[key]; return res.json({ status: "error" }); }
     res.json({ status: "success", time_left: formatTime(keys[key].expires - Date.now()) });
 });
 
-// --- BRAINROT ---
-let latestBrainrot = { brainrot: "Nenhum", value: "0", jobId: "", players: "", timestamp: 0 };
-app.get("/api/latest", (req, res) => res.json(latestBrainrot));
 app.post("/brainrot", (req, res) => {
     if (req.headers["x-auth-token"] !== SCRIPT_SECRET) return res.status(403).send("Unauthorized");
-    latestBrainrot = { ...req.body, timestamp: Date.now() / 1000 };
-    io.emit("brainrot", latestBrainrot);
+    io.emit("brainrot", req.body);
     res.json({ success: true });
 });
 
