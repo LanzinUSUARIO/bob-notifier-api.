@@ -1,114 +1,137 @@
-const express = require("express");
-const http = require("http" );
-const { Server } = require("socket.io");
-const cors = require("cors");
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+const express = require('express');
+const { Client, GatewayIntentBits } = require('discord.js');
+const app = express();
+const port = process.env.PORT || 3000;
 
-// --- CONFIGURAÇÕES ---
-const ADMIN_PASS = "Bob_Notifier"; 
-const SCRIPT_SECRET = "BOB_SECURE_2024_XYZ"; 
+// --- CONFIGURAÇÕES DE SEGURANÇA --- //
+const ADMIN_PASS = process.env.ADMIN_PASS || 'ADMIN_2024_XYZ';
+const SCRIPT_SECRET = process.env.SCRIPT_SECRET || 'BOB_SECURE_2024_XYZ';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
-let keys = {}; 
+// --- ESTADO (EM MEMÓRIA) --- //
+const keys = {}; 
+const brainrots = []; 
 
-const client = new Client({ 
-    intents: [
-        GatewayIntentBits.Guilds, 
-        GatewayIntentBits.GuildMessages, 
-        GatewayIntentBits.MessageContent // ESSENCIAL PARA LER COMANDOS
-    ] 
-});
+// --- FUNÇÕES AUXILIARES --- //
+const generateKey = () => `BOB-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
 
 const formatTime = (ms) => {
+    if (ms === Infinity) return "Lifetime";
     if (ms <= 0) return "Expirado";
-    const s = Math.floor((ms / 1000) % 60), m = Math.floor((ms / 60000) % 60), h = Math.floor(ms / 3600000);
-    return `${h}h ${m}m ${s}s`;
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const parts = [];
+    if (hours > 0) parts.push(`${hours}h`);
+    if (minutes % 60 > 0) parts.push(`${minutes % 60}m`);
+    if (seconds % 60 > 0 || parts.length === 0) parts.push(`${seconds % 60}s`);
+    return parts.join(" ");
 };
 
-// --- PAINEL DE CONTROLE PELO DISCORD ---
-client.on("messageCreate", async (msg) => {
-    if (msg.author.bot || msg.channel.id !== LOG_CHANNEL_ID) return;
-    
-    const args = msg.content.split(" ");
-    const cmd = args[0].toLowerCase();
+// --- DISCORD BOT --- //
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
-    // !info - Listar tudo
-    if (cmd === "!info") {
-        let list = "";
-        for (let k in keys) {
-            const rem = keys[k].paused ? keys[k].timeLeftMs : keys[k].expires - Date.now();
-            if (rem > 0 || keys[k].paused) {
-                list += `**Key:** \`${k}\` | ${keys[k].paused ? "⏸️" : "✅"} | ${formatTime(rem)}\n`;
+client.on("messageCreate", async message => {
+    if (message.author.bot || !message.content.startsWith("!")) return;
+    const args = message.content.slice(1).trim().split(/ +/);
+    const command = args.shift().toLowerCase();
+
+    // Comandos que exigem senha (a senha deve ser o ÚLTIMO argumento)
+    const adminPassInput = args[args.length - 1];
+    const hasAdmin = adminPassInput === ADMIN_PASS;
+
+    switch (command) {
+        case "info":
+            let info = Object.keys(keys).length ? "**Chaves:**\n" : "Nenhuma chave.";
+            for (const k in keys) {
+                const d = keys[k];
+                const t = d.paused ? d.remaining : d.expiry - Date.now();
+                info += `• \`${k}\`: ${formatTime(t)} ${d.paused ? "⏸️" : "✅"} ${d.hwid ? `(ID: ${d.hwid.substring(0,8)}...)` : "(Livre)"}\n`;
             }
-        }
-        msg.reply(list === "" ? "Nenhuma chave ativa." : "### 🔑 Painel de Controle:\n" + list);
+            message.reply(info);
+            break;
+
+        case "create":
+            if (!hasAdmin) return message.reply("Senha incorreta.");
+            args.pop(); // Remove a senha dos argumentos
+            const h = parseInt(args[0]) || 0;
+            const m = parseInt(args[1]) || 0;
+            const name = args[2] || generateKey();
+            const dur = (h * 3600 + m * 60) * 1000;
+            keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null };
+            message.reply(`Chave criada: **${name}** (${formatTime(dur)})`);
+            break;
+
+        case "reset":
+            if (!hasAdmin) return message.reply("Senha incorreta.");
+            args.pop();
+            const kReset = args[0];
+            if (keys[kReset]) {
+                keys[kReset].hwid = null;
+                message.reply(`HWID da chave \`${kReset}\` resetado!`);
+            } else message.reply("Chave não encontrada.");
+            break;
+
+        case "revoke":
+            if (!hasAdmin) return message.reply("Senha incorreta.");
+            args.pop();
+            const kRevoke = args[0];
+            if (keys[kRevoke]) {
+                delete keys[kRevoke];
+                message.reply(`Chave \`${kRevoke}\` deletada.`);
+            } else message.reply("Chave não encontrada.");
+            break;
+            
+        case "pause":
+            if (!hasAdmin) return message.reply("Senha incorreta.");
+            args.pop();
+            const kPause = args[0];
+            if (keys[kPause]) {
+                const d = keys[kPause];
+                if (d.paused) {
+                    d.expiry = Date.now() + d.remaining;
+                    d.paused = false;
+                    message.reply(`Chave \`${kPause}\` ativa novamente!`);
+                } else {
+                    d.remaining = d.expiry - Date.now();
+                    d.paused = true;
+                    message.reply(`Chave \`${kPause}\` pausada.`);
+                }
+            } else message.reply("Chave não encontrada.");
+            break;
     }
-
-    // !create <h> <m> [key] - Criar chave
-    if (cmd === "!create") {
-        const h = parseFloat(args[1] || 0), m = parseFloat(args[2] || 0);
-        let k = args[3] || "BOB-" + Math.random().toString(36).substring(2, 10).toUpperCase();
-        const ms = (h * 3600000) + (m * 60000);
-        keys[k] = { expires: Date.now() + ms, paused: false, timeLeftMs: ms };
-        msg.reply(`✅ **Criada:** \`${k}\` por ${formatTime(ms)}`);
-    }
-
-    // !revoke <key> - Deletar chave
-    if (cmd === "!revoke") {
-        const k = args[1];
-        if (keys[k]) { delete keys[k]; msg.reply(`🗑️ **Revogada:** \`${k}\``); }
-        else msg.reply("❌ Não encontrada.");
-    }
-
-    // !pause <key> - Pausar/Despausar
-    if (cmd === "!pause") {
-        const k = args[1];
-        if (!keys[k]) return msg.reply("❌ Não encontrada.");
-        if (!keys[k].paused) {
-            keys[k].paused = true;
-            keys[k].timeLeftMs = keys[k].expires - Date.now();
-            msg.reply(`⏸️ **Pausada:** \`${k}\``);
-        } else {
-            keys[k].paused = false;
-            keys[k].expires = Date.now() + keys[k].timeLeftMs;
-            msg.reply(`▶️ **Despausada:** \`${k}\``);
-        }
-    }
-
-    // !compensate <minutos> - Adicionar tempo global
-    if (cmd === "!compensate") {
-        const mins = parseFloat(args[1]);
-        if (isNaN(mins)) return msg.reply("❌ Use: `!compensate <minutos>`");
-        for (let k in keys) {
-            if (keys[k].paused) keys[k].timeLeftMs += (mins * 60000);
-            else keys[k].expires += (mins * 60000);
-        }
-        msg.reply(`🎁 **Compensação:** +${mins}m para todos.`);
-    }
-});
-
-// --- API E WEBSOCKET ---
-const app = express();
-app.use(cors());
-app.use(express.json());
-const server = http.createServer(app );
-const io = new Server(server, { cors: { origin: "*" } });
-
-app.get("/validate", (req, res) => {
-    const { key, secret } = req.query;
-    if (secret !== SCRIPT_SECRET) return res.json({ status: "error", message: "Anti-Dualhook" });
-    if (!keys[key]) return res.json({ status: "error" });
-    if (keys[key].paused) return res.json({ status: "error", message: "Pausada" });
-    if (Date.now() > keys[key].expires) { delete keys[key]; return res.json({ status: "error" }); }
-    res.json({ status: "success", time_left: formatTime(keys[key].expires - Date.now()) });
-});
-
-app.post("/brainrot", (req, res) => {
-    if (req.headers["x-auth-token"] !== SCRIPT_SECRET) return res.status(403).send("Unauthorized");
-    io.emit("brainrot", req.body);
-    res.json({ success: true });
 });
 
 client.login(DISCORD_TOKEN);
-server.listen(process.env.PORT || 3000, () => console.log("🔥 BOB ONLINE"));
+
+// --- API ENDPOINTS --- //
+app.get("/validate", (req, res) => {
+    const { key, secret, hwid } = req.query;
+    if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Anti-Dualhook!" });
+    const data = keys[key];
+    if (!data) return res.status(404).json({ status: "error", message: "Chave inválida." });
+    if (data.paused) return res.status(403).json({ status: "error", message: "Chave pausada." });
+
+    // Lógica de HWID (Aceita qualquer string enviada pelo executor)
+    if (!data.hwid) {
+        data.hwid = hwid; // Salva o HWID no primeiro uso
+    } else if (data.hwid !== hwid) {
+        return res.status(403).json({ status: "error", message: "HWID inválido! Chave presa a outro PC." });
+    }
+
+    const left = data.expiry - Date.now();
+    if (left <= 0) { delete keys[key]; return res.status(403).json({ status: "error", message: "Expirada." }); }
+    res.json({ status: "success", time_left: left });
+});
+
+app.get("/get-brainrots", (req, res) => {
+    const { key, secret, hwid } = req.query;
+    if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Anti-Dualhook!" });
+    const data = keys[key];
+    if (!data || data.hwid !== hwid || data.paused) return res.status(403).json({ status: "error", message: "Acesso negado." });
+    res.json({ status: "success", data: brainrots });
+});
+
+app.get("/", (req, res) => res.send("API Bob Online!"));
+app.listen(port, () => console.log(`Porta: ${port}`));
