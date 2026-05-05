@@ -1,17 +1,17 @@
 {
   "name": "key-system-bob-notifier",
   "version": "1.0.0",
-  "main": "server.js",
-  "dependencies": {
-    "cors": "^2.8.6",
-    "discord.js": "^14.26.4",
-    "express": "^4.22.1",
-    "socket.io": "^4.8.3"
-  },
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
-  "description": "",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "discord.js": "^14.14.1",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.4"
+  },
+  "description": "API Bob Notifier com HWID, Anti-Dualhook e WebSocket",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/LanzinUSUARIO/bob-notifier-api..git"
@@ -19,9 +19,5 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/LanzinUSUARIO/bob-notifier-api./issues"
-  },
-  "homepage": "https://github.com/LanzinUSUARIO/bob-notifier-api.#readme"
+  "type": "commonjs"
 }
