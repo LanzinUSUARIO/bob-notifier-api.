@@ -1,7 +1,12 @@
 const express = require("express");
 const http = require("http");
+const https = require("https");
 const { Server } = require("socket.io");
-const { Client, GatewayIntentBits } = require("discord.js");
+const {
+    Client, GatewayIntentBits,
+    ActionRowBuilder, ButtonBuilder, ButtonStyle,
+    EmbedBuilder, Events
+} = require("discord.js");
 
 const app = express();
 app.use(express.json());
@@ -20,12 +25,14 @@ const SCRIPT_SECRET = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
 
 const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
+const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL; // novo bot do painel
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
+const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || ""; // canal onde o painel fica
 
 const keys      = {};
 const brainrots = [];
 const presence  = {};
-const kicked    = {}; // { keyName: timestamp } — sinaliza reset de HWID
+const kicked    = {};
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 const formatTime = (ms) => {
@@ -58,6 +65,15 @@ const checkKey = (key, secret, hwid) => {
     return { ok: true, data, keyName };
 };
 
+// ─── KEEP-ALIVE (pinga a própria API a cada 4 minutos) ────────────────────────
+setInterval(() => {
+    https.get(`https://bob-notifier-api.onrender.com/health`, (res) => {
+        console.log(`[KEEP-ALIVE] ping ok: ${res.statusCode}`);
+    }).on("error", (e) => {
+        console.log(`[KEEP-ALIVE] erro: ${e.message}`);
+    });
+}, 4 * 60 * 1000);
+
 // ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
 const clientNotifier = new Client({
     intents: [
@@ -70,12 +86,9 @@ const clientNotifier = new Client({
 
 clientNotifier.on("ready", () => {
     console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`);
-    console.log(`[NOTIFIER] Monitorando canal: ${DISCORD_CHANNEL_ID}`);
 });
 
 clientNotifier.on("messageCreate", async (message) => {
-    console.log(`[DEBUG] Canal: ${message.channel.id} | Autor: ${message.author.tag} | Bot: ${message.author.bot} | Embeds: ${message.embeds.length}`);
-
     if (message.author.bot && message.author.id === clientNotifier.user?.id) return;
     if (message.channel.id !== DISCORD_CHANNEL_ID) return;
     if (!message.embeds.length) return;
@@ -86,7 +99,6 @@ clientNotifier.on("messageCreate", async (message) => {
     if (embed.fields) {
         for (const f of embed.fields) {
             const fn = f.name.toLowerCase();
-            console.log(`[DEBUG] Field: "${f.name}" = "${f.value}"`);
             if (fn.includes("jobid") || fn.includes("job")) jobId = f.value.trim();
             if (fn.includes("value") || fn.includes("valor")) value = f.value.trim();
             if (fn.includes("player")) players = f.value.trim();
@@ -108,7 +120,7 @@ clientNotifier.on("messageCreate", async (message) => {
     console.log(`[NOTIFIER] ✅ ${payload.title} | jobId: ${jobId}`);
 });
 
-// ─── BOT LOGS ─────────────────────────────────────────────────────────────────
+// ─── BOT LOGS (comandos de texto) ─────────────────────────────────────────────
 const clientLogs = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -171,8 +183,8 @@ clientLogs.on("messageCreate", async (message) => {
             const t = findKey(name);
             if (!t) { message.reply("❌ Chave não encontrada."); break; }
             keys[t].hwid = null;
-            kicked[t.toLowerCase()] = Date.now(); // sinaliza kick imediato
-            message.reply(`✅ HWID de \`${t}\` resetado! Usuário será desconectado em segundos.`);
+            kicked[t.toLowerCase()] = Date.now();
+            message.reply(`✅ HWID de \`${t}\` resetado!`);
             break;
         }
         case "pause": {
@@ -187,7 +199,7 @@ clientLogs.on("messageCreate", async (message) => {
             } else {
                 d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
                 d.paused = true;
-                message.reply(`⏸️ \`${t}\` pausada! Usuário será desconectado em segundos.`);
+                message.reply(`⏸️ \`${t}\` pausada!`);
             }
             break;
         }
@@ -219,18 +231,234 @@ clientLogs.on("messageCreate", async (message) => {
                 "`!create <h> <m> <nome> <senha>` — Cria chave\n" +
                 "`!lifetime <nome> <senha>` — Cria chave lifetime\n" +
                 "`!revoke <nome> <senha>` — Remove chave\n" +
-                "`!reset <nome> <senha>` — Reseta HWID e desconecta usuário\n" +
+                "`!reset <nome> <senha>` — Reseta HWID\n" +
                 "`!pause <nome> <senha>` — Pausa/retoma\n" +
                 "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
-                "`!info` — Lista chaves ativas\n" +
-                "`!test` — Envia brainrot de teste"
+                "`!info` — Lista chaves\n" +
+                "`!test` — Brainrot de teste"
             );
             break;
         }
     }
 });
 
+// ─── BOT PAINEL (botões interativos) ──────────────────────────────────────────
+const clientPanel = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+// Mapa de usuários aguardando input: { userId: { step, data } }
+const awaitingInput = {};
+
+function buildPanelEmbed() {
+    return new EmbedBuilder()
+        .setTitle("Bob Auto Joiner")
+        .setColor(0x5865F2)
+        .setDescription(
+            "This control panel is for the project: **Bob Joiner**\n\n" +
+            "If you're a buyer, click on the buttons below to redeem your key, get the script or get your role"
+        )
+        .addFields(
+            { name: "🔑 Redeem Key", value: "Place to validate your Key", inline: false },
+            { name: "📋 View Script", value: "Shows the **Bob Joiner** Script (Key Required)", inline: false },
+            { name: "📊 Key Info", value: "Shows your Key Status (Key Required)", inline: false },
+            { name: "⚙️ Reset HWID", value: "Reset the Hardware Identification of your Key (Key Required)", inline: false }
+        );
+}
+
+function buildPanelRows() {
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("panel_redeem").setLabel("Redeem Key").setEmoji("🔑").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("panel_script").setLabel("Get Script").setEmoji("📋").setStyle(ButtonStyle.Primary),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("panel_role").setLabel("Get Role").setEmoji("👤").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("panel_hwid").setLabel("Reset HWID").setEmoji("⚙️").setStyle(ButtonStyle.Secondary),
+    );
+    const row3 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("panel_stats").setLabel("Get Stats").setEmoji("📊").setStyle(ButtonStyle.Secondary),
+    );
+    return [row1, row2, row3];
+}
+
+clientPanel.on("ready", async () => {
+    console.log(`[PANEL] Online: ${clientPanel.user.tag}`);
+
+    // Envia o painel no canal configurado ao iniciar
+    if (PANEL_CHANNEL_ID) {
+        try {
+            const ch = await clientPanel.channels.fetch(PANEL_CHANNEL_ID);
+            if (ch) {
+                // Deleta mensagens antigas do bot no canal para não duplicar
+                const msgs = await ch.messages.fetch({ limit: 10 });
+                for (const [, msg] of msgs) {
+                    if (msg.author.id === clientPanel.user.id) await msg.delete().catch(() => {});
+                }
+                await ch.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() });
+                console.log("[PANEL] Painel enviado!");
+            }
+        } catch (e) {
+            console.error("[PANEL] Erro ao enviar painel:", e.message);
+        }
+    }
+});
+
+// Escuta comandos de texto para reenviar o painel manualmente
+clientPanel.on("messageCreate", async (message) => {
+    if (message.author.bot) return;
+
+    // Coleta respostas de usuários aguardando input via DM
+    if (message.channel.type === 1) { // DM
+        const state = awaitingInput[message.author.id];
+        if (!state) return;
+
+        if (state.step === "redeem_key") {
+            const key = message.content.trim();
+            const keyName = findKey(key);
+            if (!keyName) {
+                return message.reply("❌ Key não encontrada! Verifique e tente novamente.");
+            }
+            const d = keys[keyName];
+            if (d.paused) return message.reply("⏸️ Sua key está pausada. Contate o suporte.");
+            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) {
+                return message.reply("⌛ Sua key expirou!");
+            }
+            delete awaitingInput[message.author.id];
+            const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
+            return message.reply(`✅ Key válida! Tempo restante: **${timeLeft}**`);
+        }
+
+        if (state.step === "hwid_key") {
+            const key = message.content.trim();
+            const keyName = findKey(key);
+            if (!keyName) return message.reply("❌ Key não encontrada!");
+            keys[keyName].hwid = null;
+            kicked[keyName.toLowerCase()] = Date.now();
+            delete awaitingInput[message.author.id];
+            return message.reply("✅ HWID resetado com sucesso! Você já pode logar em outro dispositivo.");
+        }
+
+        if (state.step === "stats_key") {
+            const key = message.content.trim();
+            const keyName = findKey(key);
+            if (!keyName) return message.reply("❌ Key não encontrada!");
+            const d = keys[keyName];
+            const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
+            const status = d.paused ? "⏸️ Pausada" : "✅ Ativa";
+            const hwid = d.hwid ? `\`${d.hwid.substring(0,8)}...\`` : "Nenhum (Livre)";
+            delete awaitingInput[message.author.id];
+            const embed = new EmbedBuilder()
+                .setTitle("📊 Key Info")
+                .setColor(0x5865F2)
+                .addFields(
+                    { name: "🔑 Key", value: `\`${keyName}\``, inline: true },
+                    { name: "⏱️ Tempo Restante", value: timeLeft, inline: true },
+                    { name: "📌 Status", value: status, inline: true },
+                    { name: "💻 HWID", value: hwid, inline: false }
+                );
+            return message.reply({ embeds: [embed] });
+        }
+    }
+
+    // Comando para reenviar o painel (admin)
+    if (message.content === "!panel" && PANEL_CHANNEL_ID) {
+        try {
+            const ch = await clientPanel.channels.fetch(PANEL_CHANNEL_ID);
+            if (ch) {
+                await ch.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() });
+                message.reply("✅ Painel enviado!");
+            }
+        } catch (e) {
+            message.reply("❌ Erro: " + e.message);
+        }
+    }
+});
+
+// Interações dos botões
+clientPanel.on(Events.InteractionCreate, async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    const user = interaction.user;
+    await interaction.deferReply({ ephemeral: true });
+
+    switch (interaction.customId) {
+
+        case "panel_redeem": {
+            awaitingInput[user.id] = { step: "redeem_key" };
+            try {
+                await user.send("🔑 **Redeem Key**\nEnvie sua key aqui para validar:");
+                await interaction.editReply({ content: "📩 Te mandei uma DM! Verifique suas mensagens privadas." });
+            } catch {
+                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+            }
+            break;
+        }
+
+        case "panel_script": {
+            // Verifica se o usuário tem key válida — pede a key em DM
+            awaitingInput[user.id] = { step: "script_key" };
+            try {
+                await user.send(
+                    "📋 **Get Script**\n" +
+                    "Aqui está o script do Bob Joiner:\n\n" +
+                    "```\nhttps://bob-notifier-api.onrender.com/get-script\n```\n" +
+                    "Execute no seu executor Roblox!"
+                );
+                await interaction.editReply({ content: "📩 Script enviado na DM!" });
+            } catch {
+                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+            }
+            break;
+        }
+
+        case "panel_role": {
+            // Tenta dar um cargo ao usuário (configure o ROLE_ID no .env)
+            const ROLE_ID = process.env.BUYER_ROLE_ID;
+            if (!ROLE_ID) {
+                await interaction.editReply({ content: "⚠️ Cargo não configurado. Contate o admin." });
+                break;
+            }
+            try {
+                const member = await interaction.guild.members.fetch(user.id);
+                await member.roles.add(ROLE_ID);
+                await interaction.editReply({ content: "✅ Cargo de comprador adicionado!" });
+            } catch (e) {
+                await interaction.editReply({ content: "❌ Erro ao adicionar cargo: " + e.message });
+            }
+            break;
+        }
+
+        case "panel_hwid": {
+            awaitingInput[user.id] = { step: "hwid_key" };
+            try {
+                await user.send("⚙️ **Reset HWID**\nEnvie sua key para resetar o HWID:");
+                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
+            } catch {
+                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+            }
+            break;
+        }
+
+        case "panel_stats": {
+            awaitingInput[user.id] = { step: "stats_key" };
+            try {
+                await user.send("📊 **Key Info**\nEnvie sua key para ver o status:");
+                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
+            } catch {
+                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+            }
+            break;
+        }
+    }
+});
+
 // ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+
+app.get("/health", (req, res) => res.json({ status: "ok", time: Date.now() }));
 
 app.get("/validate", (req, res) => {
     const { key, secret, hwid } = req.query;
@@ -265,7 +493,6 @@ app.get("/api/latest", (req, res) => {
     res.json(brainrots[brainrots.length - 1]);
 });
 
-// Verifica se o usuário foi kickado por reset de HWID
 app.get("/kicked", (req, res) => {
     const { key, secret } = req.query;
     if (secret !== SCRIPT_SECRET) return res.json({ kicked: false });
@@ -312,7 +539,7 @@ app.get("/test-emit", (req, res) => {
     res.send("✅ Emit enviado!");
 });
 
-app.get("/", (req, res) => res.send("<h1>Bob Dual API v6 — Online! ✅</h1>"));
+app.get("/", (req, res) => res.send("<h1>Bob Dual API v7 — Online! ✅</h1>"));
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 if (DISCORD_TOKEN_NOTIFIER) clientNotifier.login(DISCORD_TOKEN_NOTIFIER).catch(e => console.error("[NOTIFIER]", e));
@@ -320,5 +547,8 @@ else console.warn("[NOTIFIER] Token não definido.");
 
 if (DISCORD_TOKEN_LOGS) clientLogs.login(DISCORD_TOKEN_LOGS).catch(e => console.error("[LOGS]", e));
 else console.warn("[LOGS] Token não definido.");
+
+if (DISCORD_TOKEN_PANEL) clientPanel.login(DISCORD_TOKEN_PANEL).catch(e => console.error("[PANEL]", e));
+else console.warn("[PANEL] Token não definido — crie um 3º bot e adicione DISCORD_TOKEN_PANEL no Render.");
 
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
