@@ -4,6 +4,7 @@ const { Server } = require("socket.io");
 const { Client, GatewayIntentBits } = require("discord.js");
 
 const app = express();
+app.use(express.json());
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -21,115 +22,117 @@ const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
 
-// ─── ESTADO ────────────────────────────────────────────────────────────────
-const keys      = {};   // { keyName: { expiry, paused, remaining, hwid } }
-const brainrots = [];   // { id, title, description }
+const keys      = {};
+const brainrots = [];
+const presence  = {};
 
-// ─── UTILITÁRIOS ───────────────────────────────────────────────────────────
+// ─── UTILS ────────────────────────────────────────────────────────────────────
 const formatTime = (ms) => {
     if (ms === Infinity) return "Lifetime";
     if (ms <= 0) return "Expirado";
-    let total = Math.floor(ms / 1000);
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
+    let t = Math.floor(ms / 1000);
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
     const p = [];
-    if (h > 0) p.push(`${h}h`);
-    if (m > 0) p.push(`${m}m`);
-    if (s > 0 || p.length === 0) p.push(`${s}s`);
+    if (h > 0) p.push(h + "h");
+    if (m > 0) p.push(m + "m");
+    if (s > 0 || !p.length) p.push(s + "s");
     return p.join(" ");
 };
 
 const findKey = (name) =>
     Object.keys(keys).find(k => k.toLowerCase() === (name || "").toLowerCase());
 
-// ─── BOT: BOB NOTIFIER ─────────────────────────────────────────────────────
+const checkKey = (key, secret, hwid) => {
+    if (secret !== SCRIPT_SECRET) return { ok: false, error: "Secret invalido" };
+    const keyName = findKey(key);
+    const data = keys[keyName];
+    if (!data)       return { ok: false, error: "Chave nao existe" };
+    if (data.paused) return { ok: false, error: "Chave pausada" };
+    if (data.expiry !== Infinity && data.expiry - Date.now() <= 0) {
+        delete keys[keyName];
+        return { ok: false, error: "Chave expirada" };
+    }
+    if (!data.hwid) { data.hwid = hwid; }
+    else if (data.hwid !== hwid) return { ok: false, error: "HWID invalido" };
+    return { ok: true, data, keyName };
+};
+
+// ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
 const clientNotifier = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-clientNotifier.on("ready", () =>
-    console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`)
-);
+clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 
 clientNotifier.on("messageCreate", async (message) => {
-    // Ignora apenas o próprio bot — embeds de outros bots/webhooks PASSAM
     if (message.author.id === clientNotifier.user?.id) return;
     if (message.channel.id !== DISCORD_CHANNEL_ID) return;
-    if (message.embeds.length === 0) return;
+    if (!message.embeds.length) return;
 
-    const embed   = message.embeds[0];
+    const embed = message.embeds[0];
+
+    let jobId = null, value = "0", players = "N/A";
+    if (embed.fields) {
+        for (const f of embed.fields) {
+            const fn = f.name.toLowerCase();
+            if (fn.includes("jobid") || fn.includes("job")) jobId = f.value.trim();
+            if (fn.includes("value") || fn.includes("valor")) value = f.value.trim();
+            if (fn.includes("player")) players = f.value.trim();
+        }
+    }
+
     const payload = {
         id:          Date.now().toString(),
         title:       embed.title       || "Bob!",
         description: embed.description || "Novo Alerta!",
-        jobId:       null  // preencha se o embed tiver jobId no footer/field
+        brainrot:    embed.title       || "Brainrot",
+        name:        embed.title       || "Brainrot",
+        jobId, value, players
     };
 
-    // Tenta extrair jobId de um field chamado "jobId"
-    if (embed.fields && embed.fields.length > 0) {
-        const jobField = embed.fields.find(f =>
-            f.name.toLowerCase().includes("jobid") ||
-            f.name.toLowerCase().includes("job")
-        );
-        if (jobField) payload.jobId = jobField.value.trim();
-    }
-
     brainrots.push(payload);
+    if (brainrots.length > 100) brainrots.shift();
     io.emit("brainrot", payload);
-    console.log(`[NOTIFIER] Embed recebida: ${payload.title} (id: ${payload.id})`);
+    console.log(`[NOTIFIER] ${payload.title} | jobId: ${jobId}`);
 });
 
-// ─── BOT: BOB LOGS ─────────────────────────────────────────────────────────
+// ─── BOT LOGS ─────────────────────────────────────────────────────────────────
 const clientLogs = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-clientLogs.on("ready", () =>
-    console.log(`[LOGS] Online: ${clientLogs.user.tag}`)
-);
+clientLogs.on("ready", () => console.log(`[LOGS] Online: ${clientLogs.user.tag}`));
 
 clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
     if (!message.content.startsWith("!")) return;
 
-    const args    = message.content.slice(1).trim().split(/ +/);
-    const command = args.shift().toLowerCase();
+    const args = message.content.slice(1).trim().split(/ +/);
+    const cmd  = args.shift().toLowerCase();
 
-    switch (command) {
-
-        // !test — dispara um brainrot de teste
+    switch (cmd) {
         case "test": {
-            const payload = { id: Date.now().toString(), title: "TESTE", description: "SINAL OK!" };
+            const payload = {
+                id: Date.now().toString(), title: "TESTE", description: "SINAL OK!",
+                brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A"
+            };
             brainrots.push(payload);
             io.emit("brainrot", payload);
             message.reply("✅ Teste enviado!");
             break;
         }
-
-        // !info — lista chaves ativas
         case "info": {
-            const keyList = Object.keys(keys);
-            if (!keyList.length) { message.reply("Nenhuma chave ativa."); break; }
+            const ks = Object.keys(keys);
+            if (!ks.length) { message.reply("Nenhuma chave ativa."); break; }
             let info = "**Chaves Ativas:**\n";
-            for (const k of keyList) {
+            for (const k of ks) {
                 const d = keys[k];
-                const t = d.paused ? d.remaining : d.expiry - Date.now();
-                info += `• \`${k}\`: ${formatTime(t)} ${d.paused ? "⏸️" : "✅"} ${d.hwid ? `(HWID: ${d.hwid.substring(0, 6)}...)` : "(Livre)"}\n`;
+                const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
+                info += `• \`${k}\`: ${formatTime(t)} ${d.paused ? "⏸️" : "✅"} ${d.hwid ? `(HWID: ${d.hwid.substring(0,6)}...)` : "(Livre)"}\n`;
             }
             message.reply(info);
             break;
         }
-
-        // !create <h> <m> <nome> <senha>
         case "create": {
             if (args.length < 4) { message.reply("Uso: `!create <h> <m> <nome> <senha>`"); break; }
             const [h, m, name, pass] = args;
@@ -139,8 +142,6 @@ clientLogs.on("messageCreate", async (message) => {
             message.reply(`✅ Chave \`${name}\` criada! Duração: ${formatTime(dur)}`);
             break;
         }
-
-        // !lifetime <nome> <senha>
         case "lifetime": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
@@ -148,72 +149,61 @@ clientLogs.on("messageCreate", async (message) => {
             message.reply(`✅ Chave \`${name}\` criada como **Lifetime**!`);
             break;
         }
-
-        // !reset <nome> <senha>
         case "reset": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const target = findKey(name);
-            if (!target) { message.reply("❌ Chave não encontrada."); break; }
-            keys[target].hwid = null;
-            message.reply(`✅ HWID da chave \`${target}\` resetado!`);
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            keys[t].hwid = null;
+            message.reply(`✅ HWID de \`${t}\` resetado!`);
             break;
         }
-
-        // !pause <nome> <senha>
         case "pause": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const target = findKey(name);
-            if (!target) { message.reply("❌ Chave não encontrada."); break; }
-            const d = keys[target];
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            const d = keys[t];
             if (d.paused) {
-                d.expiry = Date.now() + d.remaining;
-                d.paused = false;
-                message.reply(`▶️ Chave \`${target}\` **retomada**! Tempo restante: ${formatTime(d.remaining)}`);
+                d.expiry = Date.now() + d.remaining; d.paused = false;
+                message.reply(`▶️ \`${t}\` retomada! Tempo: ${formatTime(d.remaining)}`);
             } else {
-                d.remaining = d.expiry - Date.now();
+                d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
                 d.paused = true;
-                message.reply(`⏸️ Chave \`${target}\` **pausada**! Tempo restante: ${formatTime(d.remaining)}`);
+                message.reply(`⏸️ \`${t}\` pausada!`);
             }
             break;
         }
-
-        // !revoke <nome> <senha>
         case "revoke": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const target = findKey(name);
-            if (!target) { message.reply("❌ Chave não encontrada."); break; }
-            delete keys[target];
-            message.reply(`🗑️ Chave \`${target}\` removida.`);
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            delete keys[t];
+            message.reply(`🗑️ \`${t}\` removida.`);
             break;
         }
-
-        // !extend <nome> <h> <m> <senha>
         case "extend": {
             if (args.length < 4) { message.reply("Uso: `!extend <nome> <h> <m> <senha>`"); break; }
             const [name, h, m, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const target = findKey(name);
-            if (!target) { message.reply("❌ Chave não encontrada."); break; }
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
             const extra = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
-            const d = keys[target];
+            const d = keys[t];
             if (d.paused) d.remaining += extra;
-            else          d.expiry    += extra;
-            message.reply(`✅ Chave \`${target}\` estendida em ${formatTime(extra)}!`);
+            else if (d.expiry !== Infinity) d.expiry += extra;
+            message.reply(`✅ \`${t}\` estendida em ${formatTime(extra)}!`);
             break;
         }
-
-        // !help
         case "help": {
             message.reply(
-                "**Comandos Bob Logs:**\n" +
-                "`!create <h> <m> <nome> <senha>` — Cria chave com duração\n" +
+                "**📋 Comandos:**\n" +
+                "`!create <h> <m> <nome> <senha>` — Cria chave\n" +
                 "`!lifetime <nome> <senha>` — Cria chave lifetime\n" +
                 "`!revoke <nome> <senha>` — Remove chave\n" +
                 "`!reset <nome> <senha>` — Reseta HWID\n" +
-                "`!pause <nome> <senha>` — Pausa/retoma chave\n" +
+                "`!pause <nome> <senha>` — Pausa/retoma\n" +
                 "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
                 "`!info` — Lista chaves ativas\n" +
                 "`!test` — Envia brainrot de teste"
@@ -223,96 +213,87 @@ clientLogs.on("messageCreate", async (message) => {
     }
 });
 
-// ─── API: VALIDAÇÃO ─────────────────────────────────────────────────────────
+// ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+
+// Validação de chave
 app.get("/validate", (req, res) => {
     const { key, secret, hwid } = req.query;
-    if (secret !== SCRIPT_SECRET) return res.status(403).send("Erro: Secret Invalido");
-
-    const keyName = findKey(key);
-    const data    = keys[keyName];
-
-    if (!data)       return res.status(404).send("Erro: Chave Nao Existe");
-    if (data.paused) return res.status(403).send("Erro: Chave Pausada");
-
-    if (data.expiry !== Infinity) {
-        const left = data.expiry - Date.now();
-        if (left <= 0) { delete keys[keyName]; return res.status(403).send("Erro: Chave Expirada"); }
-    }
-
-    if (!data.hwid) {
-        data.hwid = hwid;
-        console.log(`[API] HWID gravado para ${keyName}: ${hwid}`);
-    } else if (data.hwid !== hwid) {
-        return res.status(403).send("Erro: HWID Invalido");
-    }
-
-    const timeLeft = data.expiry === Infinity ? Infinity : data.expiry - Date.now();
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).send("Erro: " + r.error);
+    const timeLeft = r.data.expiry === Infinity ? Infinity : r.data.expiry - Date.now();
     res.json({ status: "success", time_left: timeLeft });
 });
 
-// ─── API: BUSCAR BRAINROTS (POLLING DO SCRIPT ROBLOX) ──────────────────────
+// Polling simples (usado pelo script Lua /get-brainrots)
 app.get("/get-brainrots", (req, res) => {
     const { key, secret, hwid, lastId } = req.query;
-
-    if (secret !== SCRIPT_SECRET)
-        return res.status(403).json({ status: "error", message: "Secret invalido" });
-
-    const keyName = findKey(key);
-    const data    = keys[keyName];
-
-    if (!data)
-        return res.status(404).json({ status: "error", message: "Chave nao existe" });
-    if (data.paused)
-        return res.status(403).json({ status: "error", message: "Chave pausada" });
-    if (data.expiry !== Infinity && data.expiry - Date.now() <= 0) {
-        delete keys[keyName];
-        return res.status(403).json({ status: "error", message: "Chave expirada" });
-    }
-    if (data.hwid && data.hwid !== hwid)
-        return res.status(403).json({ status: "error", message: "HWID invalido" });
-
-    if (brainrots.length === 0)
-        return res.json({ status: "waiting" });
-
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    if (!brainrots.length) return res.json({ status: "waiting" });
     const latest = brainrots[brainrots.length - 1];
-
-    // Só envia se for novo
-    if (latest.id === lastId)
-        return res.json({ status: "waiting" });
-
+    if (latest.id === lastId) return res.json({ status: "waiting" });
     res.json({ status: "success", brainrot: latest });
 });
 
-// ─── API: CONTAR CLIENTES CONECTADOS ────────────────────────────────────────
-app.get("/clients", (req, res) => {
-    res.send(`Clientes Socket.IO conectados: ${io.sockets.sockets.size}`);
+// Lista todos os brainrots (usado pelo pollLogs do script)
+app.get("/logs", (req, res) => {
+    const { key, secret, hwid } = req.query;
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    res.json(brainrots);
 });
 
-// ─── API: TESTE MANUAL DE EMIT ───────────────────────────────────────────────
+// Brainrot mais recente (usado pelo pollLatest do script)
+app.get("/api/latest", (req, res) => {
+    const { key, secret, hwid } = req.query;
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    if (!brainrots.length) return res.json({ status: "waiting" });
+    res.json(brainrots[brainrots.length - 1]);
+});
+
+// Heartbeat de presença (POST = envia, GET = lista ativos)
+app.post("/presence", (req, res) => {
+    const { key, secret, hwid, sessionId, name } = req.query;
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now() };
+    res.json({ status: "ok" });
+});
+
+app.get("/presence", (req, res) => {
+    const { key, secret, hwid } = req.query;
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    const now = Date.now();
+    const active = {};
+    for (const [sid, info] of Object.entries(presence)) {
+        if (now - info.lastSeen < 30000) active[info.name] = true;
+        else delete presence[sid];
+    }
+    res.json(Object.keys(active).sort());
+});
+
+// Diagnóstico
+app.get("/clients", (req, res) =>
+    res.send(`Socket.IO: ${io.sockets.sockets.size} | Presença: ${Object.keys(presence).length}`)
+);
+
 app.get("/test-emit", (req, res) => {
-    if (req.query.secret !== SCRIPT_SECRET)
-        return res.status(403).send("Secret invalido");
-    const payload = { id: Date.now().toString(), title: "TESTE MANUAL", description: "Chegou via HTTP!" };
-    brainrots.push(payload);
-    io.emit("brainrot", payload);
+    if (req.query.secret !== SCRIPT_SECRET) return res.status(403).send("Secret invalido");
+    const p = { id: Date.now().toString(), title: "TESTE MANUAL", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "0" };
+    brainrots.push(p);
+    io.emit("brainrot", p);
     res.send("✅ Emit enviado!");
 });
 
-// ─── RAIZ ───────────────────────────────────────────────────────────────────
-app.get("/", (req, res) =>
-    res.send("<h1>Bob Dual API v5 — Online! ✅</h1>")
-);
+app.get("/", (req, res) => res.send("<h1>Bob Dual API v6 — Online! ✅</h1>"));
 
-// ─── LOGIN DOS BOTS ─────────────────────────────────────────────────────────
-if (DISCORD_TOKEN_NOTIFIER)
-    clientNotifier.login(DISCORD_TOKEN_NOTIFIER).catch(e => console.error("[NOTIFIER ERROR]", e));
-else
-    console.warn("[NOTIFIER] DISCORD_TOKEN_NOTIFIER não definido — bot offline.");
+// ─── LOGIN ────────────────────────────────────────────────────────────────────
+if (DISCORD_TOKEN_NOTIFIER) clientNotifier.login(DISCORD_TOKEN_NOTIFIER).catch(e => console.error("[NOTIFIER]", e));
+else console.warn("[NOTIFIER] Token não definido.");
 
-if (DISCORD_TOKEN_LOGS)
-    clientLogs.login(DISCORD_TOKEN_LOGS).catch(e => console.error("[LOGS ERROR]", e));
-else
-    console.warn("[LOGS] DISCORD_TOKEN_LOGS não definido — bot offline.");
+if (DISCORD_TOKEN_LOGS) clientLogs.login(DISCORD_TOKEN_LOGS).catch(e => console.error("[LOGS]", e));
+else console.warn("[LOGS] Token não definido.");
 
-// ─── START ──────────────────────────────────────────────────────────────────
-server.listen(port, () => console.log(`[SERVER] Rodando na porta ${port}`));
+server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
