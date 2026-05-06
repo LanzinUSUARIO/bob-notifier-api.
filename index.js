@@ -42,7 +42,7 @@ const formatTime = (ms) => {
 const clientNotifier = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 clientNotifier.on("messageCreate", async message => {
-    if (message.author.bot && message.author.id === clientNotifier.user.id) return;
+    if (message.author.bot) return;
     if (message.channel.id === DISCORD_CHANNEL_ID && message.embeds.length > 0) {
         const embed = message.embeds[0];
         const payload = { title: embed.title || "Bob!", description: embed.description || "Novo Alerta!" };
@@ -68,7 +68,7 @@ clientLogs.on("messageCreate", async message => {
             break;
 
         case "info":
-            let info = Object.keys(keys).length ? "**Chaves:**\n" : "Nenhuma chave.";
+            let info = Object.keys(keys).length ? "**Chaves Ativas:**\n" : "Nenhuma chave ativa.";
             for (const k in keys) {
                 const d = keys[k];
                 const t = d.paused ? d.remaining : d.expiry - Date.now();
@@ -89,27 +89,30 @@ clientLogs.on("messageCreate", async message => {
         case "reset":
             const [kReset, passReset] = args;
             if (passReset !== ADMIN_PASS) return message.reply("❌ Senha incorreta!");
-            if (keys[kReset]) { 
-                keys[kReset].hwid = null; // RESET REAL DO HWID
-                console.log(`[RESET] HWID da chave ${kReset} limpo.`);
-                message.reply(`✅ HWID da chave \`${kReset}\` resetado! O próximo PC a conectar será o novo dono.`); 
+            // Busca insensível a maiúsculas
+            const targetKey = Object.keys(keys).find(k => k.toLowerCase() === kReset.toLowerCase());
+            if (targetKey) { 
+                keys[targetKey].hwid = null;
+                message.reply(`✅ HWID da chave \`${targetKey}\` resetado!`); 
             } else message.reply("❌ Chave não encontrada.");
             break;
 
         case "pause":
             const [kPause, passPause] = args;
             if (passPause !== ADMIN_PASS) return message.reply("❌ Senha incorreta!");
-            const d = keys[kPause];
+            const targetPause = Object.keys(keys).find(k => k.toLowerCase() === kPause.toLowerCase());
+            const d = keys[targetPause];
             if (d) {
-                if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; message.reply(`▶️ \`${kPause}\` ativa!`); }
-                else { d.remaining = d.expiry - Date.now(); d.paused = true; message.reply(`⏸️ \`${kPause}\` pausada!`); }
+                if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; message.reply(`▶️ \`${targetPause}\` ativa!`); }
+                else { d.remaining = d.expiry - Date.now(); d.paused = true; message.reply(`⏸️ \`${targetPause}\` pausada!`); }
             } else message.reply("❌ Não encontrada.");
             break;
 
         case "revoke":
             const [kRevoke, passRevoke] = args;
             if (passRevoke !== ADMIN_PASS) return message.reply("❌ Senha incorreta!");
-            if (keys[kRevoke]) { delete keys[kRevoke]; message.reply(`🗑️ \`${kRevoke}\` removida.`); }
+            const targetRevoke = Object.keys(keys).find(k => k.toLowerCase() === kRevoke.toLowerCase());
+            if (targetRevoke) { delete keys[targetRevoke]; message.reply(`🗑️ \`${targetRevoke}\` removida.`); }
             else message.reply("❌ Não encontrada.");
             break;
     }
@@ -118,25 +121,34 @@ clientLogs.on("messageCreate", async message => {
 if (DISCORD_TOKEN_NOTIFIER) clientNotifier.login(DISCORD_TOKEN_NOTIFIER).catch(e => console.error(e));
 if (DISCORD_TOKEN_LOGS) clientLogs.login(DISCORD_TOKEN_LOGS).catch(e => console.error(e));
 
+// --- API DE VALIDAÇÃO BLINDADA --- //
 app.get("/validate", (req, res) => {
     const { key, secret, hwid } = req.query;
-    if (secret !== SCRIPT_SECRET) return res.status(403).send("Erro: Secret");
-    const data = keys[key];
-    if (!data) return res.status(404).send("Erro: Chave");
-    if (data.paused) return res.status(403).send("Erro: Pausada");
+    if (secret !== SCRIPT_SECRET) return res.status(403).send("Erro: Secret Invalido");
     
-    // Lógica de HWID: Se estiver nulo (após reset), ele grava o novo
-    if (!data.hwid) {
-        data.hwid = hwid;
-        console.log(`[API] Novo HWID gravado para a chave ${key}: ${hwid}`);
-    } else if (data.hwid !== hwid) {
-        return res.status(403).send("Erro: HWID");
+    // Busca a chave ignorando maiúsculas/minúsculas
+    const keyName = Object.keys(keys).find(k => k.toLowerCase() === (key || "").toLowerCase());
+    const data = keys[keyName];
+
+    if (!data) return res.status(404).send("Erro: Chave Nao Existe");
+    if (data.paused) return res.status(403).send("Erro: Chave Pausada");
+    
+    const left = data.expiry - Date.now();
+    if (left <= 0) { 
+        delete keys[keyName]; 
+        return res.status(403).send("Erro: Chave Expirada"); 
     }
 
-    const left = data.expiry - Date.now();
-    if (left <= 0) { delete keys[key]; return res.status(403).send("Erro: Expirada"); }
+    // Se o HWID estiver nulo (após reset), grava o novo
+    if (!data.hwid) {
+        data.hwid = hwid;
+        console.log(`[API] Novo HWID gravado para ${keyName}`);
+    } else if (data.hwid !== hwid) {
+        return res.status(403).send("Erro: HWID Invalido");
+    }
+
     res.json({ status: "success", time_left: left });
 });
 
-app.get("/", (req, res) => res.send("<h1>API Bob Dual v3 Online!</h1>"));
+app.get("/", (req, res) => res.send("<h1>API Bob Dual v4 Online!</h1>"));
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
