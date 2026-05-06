@@ -25,6 +25,7 @@ const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "14945291594841
 const keys      = {};
 const brainrots = [];
 const presence  = {};
+const kicked    = {}; // { keyName: timestamp } — sinaliza reset de HWID
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 const formatTime = (ms) => {
@@ -59,22 +60,33 @@ const checkKey = (key, secret, hwid) => {
 
 // ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
 const clientNotifier = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildWebhooks]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildWebhooks
+    ]
 });
 
-clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
+clientNotifier.on("ready", () => {
+    console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`);
+    console.log(`[NOTIFIER] Monitorando canal: ${DISCORD_CHANNEL_ID}`);
+});
 
 clientNotifier.on("messageCreate", async (message) => {
-    if (message.author.id === clientNotifier.user?.id) return;
+    console.log(`[DEBUG] Canal: ${message.channel.id} | Autor: ${message.author.tag} | Bot: ${message.author.bot} | Embeds: ${message.embeds.length}`);
+
+    if (message.author.bot && message.author.id === clientNotifier.user?.id) return;
     if (message.channel.id !== DISCORD_CHANNEL_ID) return;
     if (!message.embeds.length) return;
 
     const embed = message.embeds[0];
-
     let jobId = null, value = "0", players = "N/A";
+
     if (embed.fields) {
         for (const f of embed.fields) {
             const fn = f.name.toLowerCase();
+            console.log(`[DEBUG] Field: "${f.name}" = "${f.value}"`);
             if (fn.includes("jobid") || fn.includes("job")) jobId = f.value.trim();
             if (fn.includes("value") || fn.includes("valor")) value = f.value.trim();
             if (fn.includes("player")) players = f.value.trim();
@@ -93,12 +105,16 @@ clientNotifier.on("messageCreate", async (message) => {
     brainrots.push(payload);
     if (brainrots.length > 100) brainrots.shift();
     io.emit("brainrot", payload);
-    console.log(`[NOTIFIER] ${payload.title} | jobId: ${jobId}`);
+    console.log(`[NOTIFIER] ✅ ${payload.title} | jobId: ${jobId}`);
 });
 
 // ─── BOT LOGS ─────────────────────────────────────────────────────────────────
 const clientLogs = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
 });
 
 clientLogs.on("ready", () => console.log(`[LOGS] Online: ${clientLogs.user.tag}`));
@@ -155,7 +171,8 @@ clientLogs.on("messageCreate", async (message) => {
             const t = findKey(name);
             if (!t) { message.reply("❌ Chave não encontrada."); break; }
             keys[t].hwid = null;
-            message.reply(`✅ HWID de \`${t}\` resetado!`);
+            kicked[t.toLowerCase()] = Date.now(); // sinaliza kick imediato
+            message.reply(`✅ HWID de \`${t}\` resetado! Usuário será desconectado em segundos.`);
             break;
         }
         case "pause": {
@@ -170,7 +187,7 @@ clientLogs.on("messageCreate", async (message) => {
             } else {
                 d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
                 d.paused = true;
-                message.reply(`⏸️ \`${t}\` pausada!`);
+                message.reply(`⏸️ \`${t}\` pausada! Usuário será desconectado em segundos.`);
             }
             break;
         }
@@ -202,7 +219,7 @@ clientLogs.on("messageCreate", async (message) => {
                 "`!create <h> <m> <nome> <senha>` — Cria chave\n" +
                 "`!lifetime <nome> <senha>` — Cria chave lifetime\n" +
                 "`!revoke <nome> <senha>` — Remove chave\n" +
-                "`!reset <nome> <senha>` — Reseta HWID\n" +
+                "`!reset <nome> <senha>` — Reseta HWID e desconecta usuário\n" +
                 "`!pause <nome> <senha>` — Pausa/retoma\n" +
                 "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
                 "`!info` — Lista chaves ativas\n" +
@@ -215,7 +232,6 @@ clientLogs.on("messageCreate", async (message) => {
 
 // ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
-// Validação de chave
 app.get("/validate", (req, res) => {
     const { key, secret, hwid } = req.query;
     const r = checkKey(key, secret, hwid);
@@ -224,7 +240,6 @@ app.get("/validate", (req, res) => {
     res.json({ status: "success", time_left: timeLeft });
 });
 
-// Polling simples (usado pelo script Lua /get-brainrots)
 app.get("/get-brainrots", (req, res) => {
     const { key, secret, hwid, lastId } = req.query;
     const r = checkKey(key, secret, hwid);
@@ -235,7 +250,6 @@ app.get("/get-brainrots", (req, res) => {
     res.json({ status: "success", brainrot: latest });
 });
 
-// Lista todos os brainrots (usado pelo pollLogs do script)
 app.get("/logs", (req, res) => {
     const { key, secret, hwid } = req.query;
     const r = checkKey(key, secret, hwid);
@@ -243,7 +257,6 @@ app.get("/logs", (req, res) => {
     res.json(brainrots);
 });
 
-// Brainrot mais recente (usado pelo pollLatest do script)
 app.get("/api/latest", (req, res) => {
     const { key, secret, hwid } = req.query;
     const r = checkKey(key, secret, hwid);
@@ -252,7 +265,20 @@ app.get("/api/latest", (req, res) => {
     res.json(brainrots[brainrots.length - 1]);
 });
 
-// Heartbeat de presença (POST = envia, GET = lista ativos)
+// Verifica se o usuário foi kickado por reset de HWID
+app.get("/kicked", (req, res) => {
+    const { key, secret } = req.query;
+    if (secret !== SCRIPT_SECRET) return res.json({ kicked: false });
+    const keyName = findKey(key);
+    if (!keyName) return res.json({ kicked: false });
+    const ts = kicked[keyName.toLowerCase()];
+    if (ts) {
+        delete kicked[keyName.toLowerCase()];
+        return res.json({ kicked: true });
+    }
+    res.json({ kicked: false });
+});
+
 app.post("/presence", (req, res) => {
     const { key, secret, hwid, sessionId, name } = req.query;
     const r = checkKey(key, secret, hwid);
@@ -274,7 +300,6 @@ app.get("/presence", (req, res) => {
     res.json(Object.keys(active).sort());
 });
 
-// Diagnóstico
 app.get("/clients", (req, res) =>
     res.send(`Socket.IO: ${io.sockets.sockets.size} | Presença: ${Object.keys(presence).length}`)
 );
