@@ -59,7 +59,7 @@ const checkKey = (key, secret, hwid) => {
 
 // ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
 const clientNotifier = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildWebhooks]
 });
 
 clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
