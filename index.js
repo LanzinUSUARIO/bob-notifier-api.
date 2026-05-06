@@ -1,10 +1,10 @@
 const express = require("express");
-const http = require("http" );
+const http = require("http");
 const { Server } = require("socket.io");
 const { Client, GatewayIntentBits } = require("discord.js");
 
 const app = express();
-const server = http.createServer(app );
+const server = http.createServer(app);
 
 // CONFIGURAÇÃO ULTRA COMPATÍVEL DO SOCKET.IO
 const io = new Server(server, { 
@@ -18,11 +18,15 @@ const port = process.env.PORT || 3000;
 // --- CONFIGURAÇÕES VIA VARIÁVEIS DE AMBIENTE --- //
 const ADMIN_PASS = process.env.ADMIN_PASS || "ADMIN_PADRAO_MUDE_NO_RENDER";
 const SCRIPT_SECRET = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+
+// TOKENS SEPARADOS PARA OS DOIS BOTS
+const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER; // Bot que lê embeds
+const DISCORD_TOKEN_LOGS = process.env.DISCORD_TOKEN_LOGS;         // Bot que gerencia chaves
+
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
 
 const keys = {};
-const brainrots = []; // Array para armazenar os brainrots 
+const brainrots = []; 
 
 // --- AUXILIARES --- //
 const formatTime = (ms) => {
@@ -36,8 +40,8 @@ const formatTime = (ms) => {
     return p.join(" ");
 };
 
-// --- DISCORD BOT --- //
-const client = new Client({ 
+// --- 1. BOT: BOB NOTIFIER (Monitor de Embeds) --- //
+const clientNotifier = new Client({ 
     intents: [
         GatewayIntentBits.Guilds, 
         GatewayIntentBits.GuildMessages, 
@@ -45,13 +49,14 @@ const client = new Client({
     ] 
 });
 
-client.on("ready", () => {
-    console.log(`[BOT] Conectado com sucesso como: ${client.user.tag}`);
-    console.log(`[BOT] Monitorando canal: ${DISCORD_CHANNEL_ID}`);
+clientNotifier.on("ready", () => {
+    console.log(`[NOTIFIER] Conectado com sucesso como: ${clientNotifier.user.tag}`);
+    console.log(`[NOTIFIER] Monitorando canal: ${DISCORD_CHANNEL_ID}`);
 });
 
-client.on("messageCreate", async message => {
-    // 1. MONITOR DE BRAINROTS (EMBEDS)
+clientNotifier.on("messageCreate", async message => {
+    if (message.author.bot && message.author.id === clientNotifier.user.id) return;
+
     if (message.channel.id === DISCORD_CHANNEL_ID) {
         if (message.embeds.length > 0) {
             const embed = message.embeds[0];
@@ -61,14 +66,29 @@ client.on("messageCreate", async message => {
             };
             
             io.emit("brainrot", payload);
-            brainrots.push({ id: Date.now().toString(), ...payload }); // Armazena o brainrot com um ID único
+            brainrots.push({ id: Date.now().toString(), ...payload });
             console.log(`[LOG] Brainrot enviado do Discord para ${io.engine.clientsCount} scripts!`);
         }
-        return;
     }
+});
 
-    // 2. COMANDOS ADMINISTRATIVOS
+// --- 2. BOT: BOB LOGS (Comandos Administrativos) --- //
+const clientLogs = new Client({ 
+    intents: [
+        GatewayIntentBits.Guilds, 
+        GatewayIntentBits.GuildMessages, 
+        GatewayIntentBits.MessageContent
+    ] 
+});
+
+clientLogs.on("ready", () => {
+    console.log(`[LOGS] Conectado com sucesso como: ${clientLogs.user.tag}`);
+});
+
+clientLogs.on("messageCreate", async message => {
+    if (message.author.bot) return;
     if (!message.content.startsWith("!")) return;
+
     const args = message.content.slice(1).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
@@ -76,7 +96,7 @@ client.on("messageCreate", async message => {
         case "test":
             io.emit("brainrot", { title: "TESTE", description: "O APITO ESTÁ FUNCIONANDO!" });
             message.reply("✅ Sinal de teste enviado para todos os scripts conectados!");
-            console.log("[LOG] Sinal de teste disparado manualmente.");
+            console.log("[LOGS] Sinal de teste disparado manualmente.");
             break;
 
         case "info":
@@ -135,86 +155,55 @@ client.on("messageCreate", async message => {
     }
 });
 
-client.login(DISCORD_TOKEN).catch(err => {
-    console.error("[ERRO] Falha crítica ao conectar o Bot do Discord:");
-    console.error(err);
-});
+// --- INICIALIZAÇÃO DOS BOTS --- //
+if (DISCORD_TOKEN_NOTIFIER) {
+    clientNotifier.login(DISCORD_TOKEN_NOTIFIER).catch(err => console.error("[ERRO NOTIFIER]", err.message));
+} else {
+    console.warn("[AVISO] DISCORD_TOKEN_NOTIFIER não definido.");
+}
+
+if (DISCORD_TOKEN_LOGS) {
+    clientLogs.login(DISCORD_TOKEN_LOGS).catch(err => console.error("[ERRO LOGS]", err.message));
+} else {
+    console.warn("[AVISO] DISCORD_TOKEN_LOGS não definido.");
+}
 
 // --- API REST & SOCKET.IO --- //
-
 app.get("/validate", (req, res) => {
     const { key, secret, hwid } = req.query;
     if (secret !== SCRIPT_SECRET) return res.status(403).send("Anti-Dualhook: Segredo Inválido");
-    
     const data = keys[key];
     if (!data) return res.status(404).send("Chave Inválida");
     if (data.paused) return res.status(403).send("Chave Pausada");
-    
-    if (!data.hwid) {
-        data.hwid = hwid;
-    } else if (data.hwid !== hwid) {
-        return res.status(403).send("HWID Inválido (Chave em uso em outro PC)");
-    }
-
+    if (!data.hwid) data.hwid = hwid;
+    else if (data.hwid !== hwid) return res.status(403).send("HWID Inválido");
     const left = data.expiry - Date.now();
-    if (left <= 0) { 
-        delete keys[key]; 
-        return res.status(403).send("Chave Expirada"); 
-    }
-    
+    if (left <= 0) { delete keys[key]; return res.status(403).send("Chave Expirada"); }
     res.json({ status: "success", time_left: left });
 });
 
 app.get("/get-brainrots", (req, res) => {
     const { key, secret, hwid, lastId } = req.query;
-
-    // Validação básica (pode ser mais robusta)
-    if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Anti-Dualhook: Segredo Inválido" });
+    if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Segredo Inválido" });
     const data = keys[key];
     if (!data) return res.status(404).json({ status: "error", message: "Chave Inválida" });
-    if (data.paused) return res.status(403).json({ status: "error", message: "Chave Pausada" });
-    if (data.hwid && data.hwid !== hwid) return res.status(403).json({ status: "error", message: "HWID Inválido (Chave em uso em outro PC)" });
-
+    
     let latestBrainrot = null;
     if (brainrots.length > 0) {
-        const lastBrainrotIndex = brainrots.findIndex(br => br.id === lastId);
-        if (lastBrainrotIndex !== -1 && lastBrainrotIndex < brainrots.length - 1) {
-            latestBrainrot = brainrots[brainrots.length - 1]; // Retorna o mais recente se houver novos após o lastId
-        } else if (lastBrainrotIndex === -1) {
-            latestBrainrot = brainrots[brainrots.length - 1]; // Retorna o mais recente se lastId não for encontrado
+        const lastIndex = brainrots.findIndex(br => br.id === lastId);
+        if (lastIndex === -1 || lastIndex < brainrots.length - 1) {
+            latestBrainrot = brainrots[brainrots.length - 1];
         }
     }
-
-    if (latestBrainrot) {
-        res.json({ status: "success", brainrot: latestBrainrot });
-    } else {
-        res.json({ status: "success", message: "Nenhum brainrot novo." });
-    }
-
+    res.json({ status: "success", brainrot: latestBrainrot });
 });
 
 io.on("connection", (socket) => {
-    console.log(`[SOCKET] Novo script conectado. ID: ${socket.id}`);
-    
-    socket.on("authenticate", ({ key, secret, hwid }) => {
-        const d = keys[key];
-        if (secret === SCRIPT_SECRET && d && !d.paused && (d.hwid === hwid || !d.hwid)) {
-            socket.emit("authenticated", { message: "Conectado com sucesso!" });
-            console.log(`[SOCKET] Script autenticado: ${key}`);
-        } else {
-            console.log(`[SOCKET] Falha de autenticação para chave: ${key}`);
-            socket.emit("auth_error", { message: "Falha na autenticação." });
-            socket.disconnect();
-        }
-    });
-
-    socket.on("disconnect", () => {
-        console.log(`[SOCKET] Script desconectado. ID: ${socket.id}`);
-    });
+    console.log(`[SOCKET] Novo script conectado: ${socket.id}`);
 });
 
-app.get("/", (req, res) => res.send("<h1>API Bob Notifier Online!</h1><p>O Bot do Discord e o sistema de Socket estão ativos.</p>"));
+app.get("/", (req, res) => res.send("<h1>API Bob Dual Online!</h1>"));
 
 server.listen(port, () => {
-    console.log(`[SERVER] Servidor rodando na porta ${port}`);
+    console.log(`[SERVER] Rodando na porta ${port}`);
 });
