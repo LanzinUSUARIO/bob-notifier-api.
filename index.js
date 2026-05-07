@@ -25,18 +25,18 @@ const SCRIPT_SECRET = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
 
 const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
-const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL; // novo bot do painel
+const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL;
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
-const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || ""; // canal onde o painel fica
+const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "";
 
 const keys      = {};
 const brainrots = [];
-const presence  = {};
+const presence  = {};  // { sessionId: { name, lastSeen, key } }
 const kicked    = {};
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 const formatTime = (ms) => {
-    if (ms === Infinity) return "Lifetime";
+    if (ms === Infinity) return "Lifetime ♾️";
     if (ms <= 0) return "Expirado";
     let t = Math.floor(ms / 1000);
     const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
@@ -65,7 +65,7 @@ const checkKey = (key, secret, hwid) => {
     return { ok: true, data, keyName };
 };
 
-// ─── KEEP-ALIVE (pinga a própria API a cada 4 minutos) ────────────────────────
+// ─── KEEP-ALIVE ───────────────────────────────────────────────────────────────
 setInterval(() => {
     https.get(`https://bob-notifier-api.onrender.com/health`, (res) => {
         console.log(`[KEEP-ALIVE] ping ok: ${res.statusCode}`);
@@ -120,7 +120,7 @@ clientNotifier.on("messageCreate", async (message) => {
     console.log(`[NOTIFIER] ✅ ${payload.title} | jobId: ${jobId}`);
 });
 
-// ─── BOT LOGS (comandos de texto) ─────────────────────────────────────────────
+// ─── BOT LOGS ─────────────────────────────────────────────────────────────────
 const clientLogs = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -139,6 +139,66 @@ clientLogs.on("messageCreate", async (message) => {
     const cmd  = args.shift().toLowerCase();
 
     switch (cmd) {
+
+        case "online": {
+            const now = Date.now();
+
+            // Limpa sessões antigas (sem ping há mais de 30s)
+            for (const [sid, info] of Object.entries(presence)) {
+                if (now - info.lastSeen >= 30000) delete presence[sid];
+            }
+
+            // Agrupa por key (evita duplicatas de múltiplas sessões)
+            const userMap = {}; // { robloxName: { timeLeft, status, discordId } }
+            for (const [, info] of Object.entries(presence)) {
+                const robloxName = info.name || "?";
+                if (userMap[robloxName]) continue;
+
+                const keyName = info.key ? findKey(info.key) : null;
+                const keyData = keyName ? keys[keyName] : null;
+
+                let timeLeft = "?";
+                let status = "✅";
+
+                if (keyData) {
+                    if (keyData.paused) {
+                        timeLeft = formatTime(keyData.remaining);
+                        status = "⏸️";
+                    } else {
+                        timeLeft = keyData.expiry === Infinity
+                            ? "Lifetime ♾️"
+                            : formatTime(keyData.expiry - now);
+                    }
+                }
+
+                // Busca discordId vinculado à key
+                const discordId = keyData?.discordId || null;
+
+                userMap[robloxName] = { timeLeft, status, discordId };
+            }
+
+            const userList = Object.entries(userMap);
+
+            const embed = new EmbedBuilder()
+                .setTitle("🟢 Usuários Online no Script")
+                .setColor(0x00C853)
+                .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online` })
+                .setTimestamp();
+
+            if (userList.length === 0) {
+                embed.setDescription("Nenhum usuário online no momento.");
+            } else {
+                const lines = userList.map(([robloxName, data]) => {
+                    const discordMention = data.discordId ? `<@${data.discordId}>` : "*(sem Discord vinculado)*";
+                    return `${data.status} **${robloxName}** — ${discordMention} — ⏱️ ${data.timeLeft}`;
+                });
+                embed.setDescription(lines.join("\n"));
+            }
+
+            await message.reply({ embeds: [embed] });
+            break;
+        }
+
         case "test": {
             const payload = {
                 id: Date.now().toString(), title: "TESTE", description: "SINAL OK!",
@@ -149,6 +209,7 @@ clientLogs.on("messageCreate", async (message) => {
             message.reply("✅ Teste enviado!");
             break;
         }
+
         case "info": {
             const ks = Object.keys(keys);
             if (!ks.length) { message.reply("Nenhuma chave ativa."); break; }
@@ -156,27 +217,31 @@ clientLogs.on("messageCreate", async (message) => {
             for (const k of ks) {
                 const d = keys[k];
                 const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
-                info += `• \`${k}\`: ${formatTime(t)} ${d.paused ? "⏸️" : "✅"} ${d.hwid ? `(HWID: ${d.hwid.substring(0,6)}...)` : "(Livre)"}\n`;
+                const discord = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
+                info += `• \`${k}\`: ${formatTime(t)} ${d.paused ? "⏸️" : "✅"} ${discord} ${d.hwid ? `(HWID: ${d.hwid.substring(0,6)}...)` : "(Livre)"}\n`;
             }
             message.reply(info);
             break;
         }
+
         case "create": {
             if (args.length < 4) { message.reply("Uso: `!create <h> <m> <nome> <senha>`"); break; }
             const [h, m, name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
             const dur = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
-            keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null };
+            keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
             message.reply(`✅ Chave \`${name}\` criada! Duração: ${formatTime(dur)}`);
             break;
         }
+
         case "lifetime": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null };
+            keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
             message.reply(`✅ Chave \`${name}\` criada como **Lifetime**!`);
             break;
         }
+
         case "reset": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
@@ -187,6 +252,7 @@ clientLogs.on("messageCreate", async (message) => {
             message.reply(`✅ HWID de \`${t}\` resetado!`);
             break;
         }
+
         case "pause": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
@@ -203,6 +269,7 @@ clientLogs.on("messageCreate", async (message) => {
             }
             break;
         }
+
         case "revoke": {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
@@ -212,6 +279,7 @@ clientLogs.on("messageCreate", async (message) => {
             message.reply(`🗑️ \`${t}\` removida.`);
             break;
         }
+
         case "extend": {
             if (args.length < 4) { message.reply("Uso: `!extend <nome> <h> <m> <senha>`"); break; }
             const [name, h, m, pass] = args;
@@ -225,6 +293,7 @@ clientLogs.on("messageCreate", async (message) => {
             message.reply(`✅ \`${t}\` estendida em ${formatTime(extra)}!`);
             break;
         }
+
         case "help": {
             message.reply(
                 "**📋 Comandos:**\n" +
@@ -235,6 +304,7 @@ clientLogs.on("messageCreate", async (message) => {
                 "`!pause <nome> <senha>` — Pausa/retoma\n" +
                 "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
                 "`!info` — Lista chaves\n" +
+                "`!online` — Usuários online no script\n" +
                 "`!test` — Brainrot de teste"
             );
             break;
@@ -242,7 +312,7 @@ clientLogs.on("messageCreate", async (message) => {
     }
 });
 
-// ─── BOT PAINEL (botões interativos) ──────────────────────────────────────────
+// ─── BOT PAINEL ───────────────────────────────────────────────────────────────
 const clientPanel = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -251,7 +321,6 @@ const clientPanel = new Client({
     ]
 });
 
-// Mapa de usuários aguardando input: { userId: { step, data } }
 const awaitingInput = {};
 
 function buildPanelEmbed() {
@@ -287,13 +356,10 @@ function buildPanelRows() {
 
 clientPanel.on("ready", async () => {
     console.log(`[PANEL] Online: ${clientPanel.user.tag}`);
-
-    // Envia o painel no canal configurado ao iniciar
     if (PANEL_CHANNEL_ID) {
         try {
             const ch = await clientPanel.channels.fetch(PANEL_CHANNEL_ID);
             if (ch) {
-                // Deleta mensagens antigas do bot no canal para não duplicar
                 const msgs = await ch.messages.fetch({ limit: 10 });
                 for (const [, msg] of msgs) {
                     if (msg.author.id === clientPanel.user.id) await msg.delete().catch(() => {});
@@ -307,29 +373,59 @@ clientPanel.on("ready", async () => {
     }
 });
 
-// Escuta comandos de texto para reenviar o painel manualmente
 clientPanel.on("messageCreate", async (message) => {
     if (message.author.bot) return;
 
-    // Coleta respostas de usuários aguardando input via DM
-    if (message.channel.type === 1) { // DM
+    // ── DMs ──────────────────────────────────────────────────────────────────
+    if (message.channel.type === 1) {
         const state = awaitingInput[message.author.id];
         if (!state) return;
 
         if (state.step === "redeem_key") {
             const key = message.content.trim();
             const keyName = findKey(key);
-            if (!keyName) {
-                return message.reply("❌ Key não encontrada! Verifique e tente novamente.");
-            }
+            if (!keyName) return message.reply("❌ Key não encontrada!");
             const d = keys[keyName];
-            if (d.paused) return message.reply("⏸️ Sua key está pausada. Contate o suporte.");
-            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) {
-                return message.reply("⌛ Sua key expirou!");
-            }
+            if (d.paused) return message.reply("⏸️ Sua key está pausada.");
+            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
             delete awaitingInput[message.author.id];
             const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
             return message.reply(`✅ Key válida! Tempo restante: **${timeLeft}**`);
+        }
+
+        // ── GET ROLE: vincula discordId à key ─────────────────────────────────
+        if (state.step === "role_key") {
+            const key = message.content.trim();
+            const keyName = findKey(key);
+            if (!keyName) return message.reply("❌ Key não encontrada!");
+            const d = keys[keyName];
+            if (d.paused) return message.reply("⏸️ Sua key está pausada.");
+            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
+
+            // Verifica se a key já está vinculada a outro Discord
+            if (d.discordId && d.discordId !== message.author.id) {
+                return message.reply("❌ Essa key já está vinculada a outro Discord!");
+            }
+
+            // Salva o Discord ID na key
+            d.discordId = message.author.id;
+            delete awaitingInput[message.author.id];
+
+            // Tenta dar o cargo
+            const ROLE_ID = process.env.BUYER_ROLE_ID;
+            if (ROLE_ID && state.guildId) {
+                try {
+                    const guild = await clientPanel.guilds.fetch(state.guildId);
+                    const member = await guild.members.fetch(message.author.id);
+                    await member.roles.add(ROLE_ID);
+                    return message.reply(`✅ Discord vinculado à key \`${keyName}\` e cargo adicionado!`);
+                } catch (e) {
+                    console.error("[PANEL] Erro ao dar cargo:", e.message);
+                    return message.reply(`✅ Discord vinculado à key \`${keyName}\`! (Não foi possível adicionar o cargo automaticamente)`);
+                }
+            }
+
+            return message.reply(`✅ Discord vinculado à key \`${keyName}\` com sucesso!`);
         }
 
         if (state.step === "hwid_key") {
@@ -339,7 +435,7 @@ clientPanel.on("messageCreate", async (message) => {
             keys[keyName].hwid = null;
             kicked[keyName.toLowerCase()] = Date.now();
             delete awaitingInput[message.author.id];
-            return message.reply("✅ HWID resetado com sucesso! Você já pode logar em outro dispositivo.");
+            return message.reply("✅ HWID resetado! Já pode logar em outro dispositivo.");
         }
 
         if (state.step === "stats_key") {
@@ -350,6 +446,7 @@ clientPanel.on("messageCreate", async (message) => {
             const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
             const status = d.paused ? "⏸️ Pausada" : "✅ Ativa";
             const hwid = d.hwid ? `\`${d.hwid.substring(0,8)}...\`` : "Nenhum (Livre)";
+            const discord = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
             delete awaitingInput[message.author.id];
             const embed = new EmbedBuilder()
                 .setTitle("📊 Key Info")
@@ -358,13 +455,13 @@ clientPanel.on("messageCreate", async (message) => {
                     { name: "🔑 Key", value: `\`${keyName}\``, inline: true },
                     { name: "⏱️ Tempo Restante", value: timeLeft, inline: true },
                     { name: "📌 Status", value: status, inline: true },
-                    { name: "💻 HWID", value: hwid, inline: false }
+                    { name: "💻 HWID", value: hwid, inline: false },
+                    { name: "👤 Discord", value: discord, inline: false }
                 );
             return message.reply({ embeds: [embed] });
         }
     }
 
-    // Comando para reenviar o painel (admin)
     if (message.content === "!panel" && PANEL_CHANNEL_ID) {
         try {
             const ch = await clientPanel.channels.fetch(PANEL_CHANNEL_ID);
@@ -378,78 +475,62 @@ clientPanel.on("messageCreate", async (message) => {
     }
 });
 
-// Interações dos botões
 clientPanel.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton()) return;
-
     const user = interaction.user;
     await interaction.deferReply({ ephemeral: true });
 
     switch (interaction.customId) {
-
         case "panel_redeem": {
             awaitingInput[user.id] = { step: "redeem_key" };
             try {
                 await user.send("🔑 **Redeem Key**\nEnvie sua key aqui para validar:");
-                await interaction.editReply({ content: "📩 Te mandei uma DM! Verifique suas mensagens privadas." });
+                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
             } catch {
-                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
             }
             break;
         }
-
         case "panel_script": {
-            // Verifica se o usuário tem key válida — pede a key em DM
-            awaitingInput[user.id] = { step: "script_key" };
             try {
                 await user.send(
-                    "📋 **Get Script**\n" +
-                    "Aqui está o script do Bob Joiner:\n\n" +
-                    "```\nhttps://bob-notifier-api.onrender.com/get-script\n```\n" +
-                    "Execute no seu executor Roblox!"
+                    "📋 **Get Script**\nAqui está o script do Bob Joiner:\n\n" +
+                    "```\nhttps://bob-notifier-api.onrender.com/get-script\n```\nExecute no seu executor Roblox!"
                 );
                 await interaction.editReply({ content: "📩 Script enviado na DM!" });
             } catch {
-                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
             }
             break;
         }
-
         case "panel_role": {
-            // Tenta dar um cargo ao usuário (configure o ROLE_ID no .env)
-            const ROLE_ID = process.env.BUYER_ROLE_ID;
-            if (!ROLE_ID) {
-                await interaction.editReply({ content: "⚠️ Cargo não configurado. Contate o admin." });
-                break;
-            }
+            // Pede a key na DM para vincular o Discord ID
+            awaitingInput[user.id] = { step: "role_key", guildId: interaction.guildId };
             try {
-                const member = await interaction.guild.members.fetch(user.id);
-                await member.roles.add(ROLE_ID);
-                await interaction.editReply({ content: "✅ Cargo de comprador adicionado!" });
-            } catch (e) {
-                await interaction.editReply({ content: "❌ Erro ao adicionar cargo: " + e.message });
+                await user.send("👤 **Get Role**\nEnvie sua key para vincular seu Discord e receber o cargo:");
+                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
+            } catch {
+                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
             }
             break;
         }
-
         case "panel_hwid": {
             awaitingInput[user.id] = { step: "hwid_key" };
             try {
-                await user.send("⚙️ **Reset HWID**\nEnvie sua key para resetar o HWID:");
+                await user.send("⚙️ **Reset HWID**\nEnvie sua key:");
                 await interaction.editReply({ content: "📩 Te mandei uma DM!" });
             } catch {
-                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
             }
             break;
         }
-
         case "panel_stats": {
             awaitingInput[user.id] = { step: "stats_key" };
             try {
-                await user.send("📊 **Key Info**\nEnvie sua key para ver o status:");
+                await user.send("📊 **Key Info**\nEnvie sua key:");
                 await interaction.editReply({ content: "📩 Te mandei uma DM!" });
             } catch {
-                await interaction.editReply({ content: "❌ Não consegui te mandar DM. Habilite mensagens privadas do servidor!" });
+                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
             }
             break;
         }
@@ -499,10 +580,7 @@ app.get("/kicked", (req, res) => {
     const keyName = findKey(key);
     if (!keyName) return res.json({ kicked: false });
     const ts = kicked[keyName.toLowerCase()];
-    if (ts) {
-        delete kicked[keyName.toLowerCase()];
-        return res.json({ kicked: true });
-    }
+    if (ts) { delete kicked[keyName.toLowerCase()]; return res.json({ kicked: true }); }
     res.json({ kicked: false });
 });
 
@@ -510,7 +588,7 @@ app.post("/presence", (req, res) => {
     const { key, secret, hwid, sessionId, name } = req.query;
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
-    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now() };
+    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: key || "" };
     res.json({ status: "ok" });
 });
 
@@ -539,7 +617,7 @@ app.get("/test-emit", (req, res) => {
     res.send("✅ Emit enviado!");
 });
 
-app.get("/", (req, res) => res.send("<h1>Bob Dual API v7 — Online! ✅</h1>"));
+app.get("/", (req, res) => res.send("<h1>Bob Dual API v8 — Online! ✅</h1>"));
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 if (DISCORD_TOKEN_NOTIFIER) clientNotifier.login(DISCORD_TOKEN_NOTIFIER).catch(e => console.error("[NOTIFIER]", e));
@@ -549,6 +627,6 @@ if (DISCORD_TOKEN_LOGS) clientLogs.login(DISCORD_TOKEN_LOGS).catch(e => console.
 else console.warn("[LOGS] Token não definido.");
 
 if (DISCORD_TOKEN_PANEL) clientPanel.login(DISCORD_TOKEN_PANEL).catch(e => console.error("[PANEL]", e));
-else console.warn("[PANEL] Token não definido — crie um 3º bot e adicione DISCORD_TOKEN_PANEL no Render.");
+else console.warn("[PANEL] Token não definido.");
 
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
