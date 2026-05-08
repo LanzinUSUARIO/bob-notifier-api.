@@ -132,6 +132,7 @@ const clientLogs = new Client({
 clientLogs.on("ready", () => console.log(`[LOGS] Online: ${clientLogs.user.tag}`));
 
 clientLogs.on("messageCreate", async (message) => {
+    console.log(`[LOGS DEBUG] msg: "${message.content}" | author: ${message.author.tag} | bot: ${message.author.bot}`);
     if (message.author.bot) return;
     if (!message.content.startsWith("!")) return;
 
