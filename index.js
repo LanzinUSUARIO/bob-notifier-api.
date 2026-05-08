@@ -2,10 +2,9 @@ const express = require("express");
 const http = require("http");
 const https = require("https");
 const { Server } = require("socket.io");
-const {
-    Client, GatewayIntentBits,
+const { Client, GatewayIntentBits,
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
-    EmbedBuilder, Events
+    EmbedBuilder, Events, ChannelType, Partials
 } = require("discord.js");
 
 const app = express();
@@ -318,8 +317,10 @@ const clientPanel = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages
+    ],
+    partials: [Partials.Channel, Partials.Message]
 });
 
 const awaitingInput = {};
@@ -378,7 +379,7 @@ clientPanel.on("messageCreate", async (message) => {
     if (message.author.bot) return;
 
     // ── DMs ──────────────────────────────────────────────────────────────────
-    if (message.channel.type === 1) {
+    if (message.channel.type === ChannelType.DM) {
         const state = awaitingInput[message.author.id];
         if (!state) return;
 
@@ -463,13 +464,10 @@ clientPanel.on("messageCreate", async (message) => {
         }
     }
 
-    if (message.content === "!panel" && PANEL_CHANNEL_ID) {
+    if (message.content === "!panel") {
         try {
-            const ch = await clientPanel.channels.fetch(PANEL_CHANNEL_ID);
-            if (ch) {
-                await ch.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() });
-                message.reply("✅ Painel enviado!");
-            }
+            await message.channel.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() });
+            message.reply("✅ Painel enviado!");
         } catch (e) {
             message.reply("❌ Erro: " + e.message);
         }
