@@ -625,22 +625,19 @@ console.log("[LOGIN] NOTIFIER token:", DISCORD_TOKEN_NOTIFIER ? "definido" : "AU
 console.log("[LOGIN] LOGS token:",     DISCORD_TOKEN_LOGS     ? "definido" : "AUSENTE");
 console.log("[LOGIN] PANEL token:",    DISCORD_TOKEN_PANEL    ? "definido" : "AUSENTE");
 
-if (DISCORD_TOKEN_NOTIFIER) {
-    clientNotifier.login(DISCORD_TOKEN_NOTIFIER)
-        .then(() => console.log("[NOTIFIER] Login OK"))
-        .catch(e => console.error("[NOTIFIER] Erro login:", e.message));
-} else console.warn("[NOTIFIER] Token ausente.");
+const loginTimeout = (client, token, name) => {
+    if (!token) { console.warn(`[${name}] Token ausente.`); return; }
+    console.log(`[${name}] Tentando login...`);
+    const timer = setTimeout(() => {
+        console.error(`[${name}] Login TIMEOUT após 15s — possível bloqueio de rede`);
+    }, 15000);
+    client.login(token)
+        .then(() => { clearTimeout(timer); console.log(`[${name}] Login OK`); })
+        .catch(e => { clearTimeout(timer); console.error(`[${name}] Erro login: ${e.message}`); });
+};
 
-if (DISCORD_TOKEN_LOGS) {
-    clientLogs.login(DISCORD_TOKEN_LOGS)
-        .then(() => console.log("[LOGS] Login OK"))
-        .catch(e => console.error("[LOGS] Erro login:", e.message));
-} else console.warn("[LOGS] Token ausente.");
-
-if (DISCORD_TOKEN_PANEL) {
-    clientPanel.login(DISCORD_TOKEN_PANEL)
-        .then(() => console.log("[PANEL] Login OK"))
-        .catch(e => console.error("[PANEL] Erro login:", e.message));
-} else console.warn("[PANEL] Token ausente.");
+loginTimeout(clientNotifier, DISCORD_TOKEN_NOTIFIER, "NOTIFIER");
+loginTimeout(clientLogs,     DISCORD_TOKEN_LOGS,     "LOGS");
+loginTimeout(clientPanel,    DISCORD_TOKEN_PANEL,    "PANEL");
 
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
