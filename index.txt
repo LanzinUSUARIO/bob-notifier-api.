@@ -265,50 +265,33 @@ clientLogs.on("messageCreate", async (message) => {
 
     switch (cmd) {
 
-        // ── !online — atualiza em tempo real ──────────────────────────────────
         case "online": {
             const buildOnlineEmbed = () => {
                 const now = Date.now();
-
-                // Limpa sessões antigas
                 for (const [sid, info] of Object.entries(presence)) {
                     if (now - info.lastSeen >= 30000) delete presence[sid];
                 }
-
-                // Agrupa por nome (evita duplicatas)
                 const userMap = {};
                 for (const [, info] of Object.entries(presence)) {
                     if (now - info.lastSeen >= 30000) continue;
                     const robloxName = info.name || "?";
                     if (userMap[robloxName]) continue;
-
                     const keyName = info.key ? findKey(info.key) : null;
                     const keyData = keyName ? keys[keyName] : null;
-
                     let timeLeft = "?", status = "✅";
                     if (keyData) {
-                        if (keyData.paused) {
-                            timeLeft = formatTime(keyData.remaining);
-                            status = "⏸️";
-                        } else {
-                            timeLeft = keyData.expiry === Infinity
-                                ? "Lifetime ♾️"
-                                : formatTime(keyData.expiry - now);
-                        }
+                        if (keyData.paused) { timeLeft = formatTime(keyData.remaining); status = "⏸️"; }
+                        else { timeLeft = keyData.expiry === Infinity ? "Lifetime ♾️" : formatTime(keyData.expiry - now); }
                     }
-
                     const discordId = keyData?.discordId || null;
                     userMap[robloxName] = { timeLeft, status, discordId };
                 }
-
                 const userList = Object.entries(userMap);
-
                 const embed = new EmbedBuilder()
                     .setTitle("🟢 Usuários Online no Script")
                     .setColor(0x00C853)
                     .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s` })
                     .setTimestamp();
-
                 if (userList.length === 0) {
                     embed.setDescription("Nenhum usuário online no momento.");
                 } else {
@@ -318,14 +301,9 @@ clientLogs.on("messageCreate", async (message) => {
                     });
                     embed.setDescription(lines.join("\n"));
                 }
-
                 return embed;
             };
-
-            // Envia a mensagem inicial
             const sentMsg = await message.reply({ embeds: [buildOnlineEmbed()] });
-
-            // Edita a cada 5s por 5 minutos (60 edições)
             let edits = 0;
             const MAX_EDITS = 60;
             const interval = setInterval(async () => {
@@ -340,7 +318,6 @@ clientLogs.on("messageCreate", async (message) => {
                 }
                 await sentMsg.edit({ embeds: [buildOnlineEmbed()] }).catch(() => clearInterval(interval));
             }, 5000);
-
             break;
         }
 
@@ -549,7 +526,6 @@ clientPanel.on("ready", async () => {
 clientPanel.on("messageCreate", async (message) => {
     if (message.author.bot) return;
 
-    // ── DMs ──────────────────────────────────────────────────────────────────
     if (message.channel.type === ChannelType.DM) {
         const state = awaitingInput[message.author.id];
         if (!state) return;
@@ -792,6 +768,32 @@ app.get("/test-emit", (req, res) => {
     brainrots.push(p);
     io.emit("brainrot", p);
     res.send("✅ Emit enviado!");
+});
+
+// ─── /push-brainrot — recebe do script hop direto ─────────────────────────────
+app.post("/push-brainrot", requireClientHeader, (req, res) => {
+    const { secret, title, description, jobId, value, players } = req.body;
+
+    if (secret !== SCRIPT_SECRET)
+        return res.status(403).json({ status: "error", message: "Secret inválido" });
+
+    const payload = {
+        id:          Date.now().toString(),
+        title:       title       || "Brainrot",
+        description: description || "",
+        brainrot:    title       || "Brainrot",
+        name:        title       || "Brainrot",
+        jobId:       jobId       || null,
+        value:       value       || "0",
+        players:     players     || "N/A"
+    };
+
+    brainrots.push(payload);
+    if (brainrots.length > 100) brainrots.shift();
+    io.emit("brainrot", payload);
+
+    console.log(`[PUSH] ✅ ${payload.title} | jobId: ${payload.jobId} | Value: ${payload.value}`);
+    res.json({ status: "ok", id: payload.id });
 });
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
