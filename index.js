@@ -620,25 +620,27 @@ app.get("/test-emit", (req, res) => {
 
 app.get("/", (req, res) => res.send("<h1>Bob Dual API v8 — Online! ✅</h1>"));
 
-// ─── LOGIN COM AUTO-RECONNECT ─────────────────────────────────────────────────
-function loginWithRetry(client, token, name) {
-    if (!token) { console.warn(`[${name}] Token não definido.`); return; }
-    client.login(token).catch(e => {
-        console.error(`[${name}] Erro no login: ${e.message}. Tentando novamente em 10s...`);
-        setTimeout(() => loginWithRetry(client, token, name), 10000);
-    });
-    client.on("disconnect", () => {
-        console.warn(`[${name}] Desconectado! Reconectando em 5s...`);
-        setTimeout(() => loginWithRetry(client, token, name), 5000);
-    });
-    client.on("error", (e) => {
-        console.error(`[${name}] Erro: ${e.message}. Reconectando em 5s...`);
-        setTimeout(() => loginWithRetry(client, token, name), 5000);
-    });
-}
+// ─── LOGIN ────────────────────────────────────────────────────────────────────
+console.log("[LOGIN] NOTIFIER token:", DISCORD_TOKEN_NOTIFIER ? "definido" : "AUSENTE");
+console.log("[LOGIN] LOGS token:",     DISCORD_TOKEN_LOGS     ? "definido" : "AUSENTE");
+console.log("[LOGIN] PANEL token:",    DISCORD_TOKEN_PANEL    ? "definido" : "AUSENTE");
 
-loginWithRetry(clientNotifier, DISCORD_TOKEN_NOTIFIER, "NOTIFIER");
-loginWithRetry(clientLogs,     DISCORD_TOKEN_LOGS,     "LOGS");
-loginWithRetry(clientPanel,    DISCORD_TOKEN_PANEL,    "PANEL");
+if (DISCORD_TOKEN_NOTIFIER) {
+    clientNotifier.login(DISCORD_TOKEN_NOTIFIER)
+        .then(() => console.log("[NOTIFIER] Login OK"))
+        .catch(e => console.error("[NOTIFIER] Erro login:", e.message));
+} else console.warn("[NOTIFIER] Token ausente.");
+
+if (DISCORD_TOKEN_LOGS) {
+    clientLogs.login(DISCORD_TOKEN_LOGS)
+        .then(() => console.log("[LOGS] Login OK"))
+        .catch(e => console.error("[LOGS] Erro login:", e.message));
+} else console.warn("[LOGS] Token ausente.");
+
+if (DISCORD_TOKEN_PANEL) {
+    clientPanel.login(DISCORD_TOKEN_PANEL)
+        .then(() => console.log("[PANEL] Login OK"))
+        .catch(e => console.error("[PANEL] Erro login:", e.message));
+} else console.warn("[PANEL] Token ausente.");
 
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
