@@ -9,6 +9,7 @@
     "cors": "^2.8.6",
     "discord.js": "^14.26.4",
     "express": "^4.22.1",
+    "mongoose": "^9.6.1",
     "socket.io": "^4.8.3"
   },
   "description": "API Bob Notifier com HWID, Anti-Dualhook e WebSocket",

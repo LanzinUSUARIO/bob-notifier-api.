@@ -6,6 +6,68 @@ const { Client, GatewayIntentBits,
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
     EmbedBuilder, Events, ChannelType, Partials
 } = require("discord.js");
+const mongoose = require("mongoose");
+
+// ─── MONGODB ──────────────────────────────────────────────────────────────────
+const MONGODB_URI = process.env.MONGODB_URI;
+if (MONGODB_URI) {
+    mongoose.connect(MONGODB_URI)
+        .then(() => console.log("[DB] MongoDB conectado!"))
+        .catch(e => console.error("[DB] Erro:", e.message));
+} else {
+    console.warn("[DB] MONGODB_URI não definido — keys não persistem!");
+}
+
+const KeySchema = new mongoose.Schema({
+    name:      { type: String, required: true, unique: true },
+    expiry:    { type: Number, default: Infinity },
+    paused:    { type: Boolean, default: false },
+    remaining: { type: Number, default: 0 },
+    hwid:      { type: String, default: null },
+    discordId: { type: String, default: null }
+});
+const KeyModel = mongoose.model("Key", KeySchema);
+
+// Carrega keys do banco para memória
+async function loadKeys() {
+    try {
+        const docs = await KeyModel.find({});
+        for (const d of docs) {
+            keys[d.name] = {
+                expiry:    d.expiry,
+                paused:    d.paused,
+                remaining: d.remaining,
+                hwid:      d.hwid,
+                discordId: d.discordId
+            };
+        }
+        console.log(`[DB] ${docs.length} keys carregadas.`);
+    } catch (e) {
+        console.error("[DB] Erro ao carregar keys:", e.message);
+    }
+}
+
+// Salva ou atualiza uma key no banco
+async function saveKey(name) {
+    try {
+        await KeyModel.findOneAndUpdate(
+            { name },
+            { name, ...keys[name] },
+            { upsert: true, new: true }
+        );
+    } catch (e) {
+        console.error("[DB] Erro ao salvar key:", e.message);
+    }
+}
+
+// Remove uma key do banco
+async function deleteKey(name) {
+    try {
+        await KeyModel.deleteOne({ name });
+    } catch (e) {
+        console.error("[DB] Erro ao deletar key:", e.message);
+    }
+}
 
 const app = express();
 app.use(express.json());
@@ -230,6 +292,7 @@ clientLogs.on("messageCreate", async (message) => {
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
             const dur = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
             keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
+            await saveKey(name);
             message.reply(`✅ Chave \`${name}\` criada! Duração: ${formatTime(dur)}`);
             break;
         }
@@ -238,6 +301,7 @@ clientLogs.on("messageCreate", async (message) => {
             const [name, pass] = args;
             if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
             keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
+            await saveKey(name);
             message.reply(`✅ Chave \`${name}\` criada como **Lifetime**!`);
             break;
         }
@@ -249,6 +313,7 @@ clientLogs.on("messageCreate", async (message) => {
             if (!t) { message.reply("❌ Chave não encontrada."); break; }
             keys[t].hwid = null;
             kicked[t.toLowerCase()] = Date.now();
+            await saveKey(t);
             message.reply(`✅ HWID de \`${t}\` resetado!`);
             break;
         }
@@ -261,10 +326,12 @@ clientLogs.on("messageCreate", async (message) => {
             const d = keys[t];
             if (d.paused) {
                 d.expiry = Date.now() + d.remaining; d.paused = false;
+                await saveKey(t);
                 message.reply(`▶️ \`${t}\` retomada! Tempo: ${formatTime(d.remaining)}`);
             } else {
                 d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
                 d.paused = true;
+                await saveKey(t);
                 message.reply(`⏸️ \`${t}\` pausada!`);
             }
             break;
@@ -276,6 +343,7 @@ clientLogs.on("messageCreate", async (message) => {
             const t = findKey(name);
             if (!t) { message.reply("❌ Chave não encontrada."); break; }
             delete keys[t];
+            await deleteKey(t);
             message.reply(`🗑️ \`${t}\` removida.`);
             break;
         }
@@ -290,6 +358,7 @@ clientLogs.on("messageCreate", async (message) => {
             const d = keys[t];
             if (d.paused) d.remaining += extra;
             else if (d.expiry !== Infinity) d.expiry += extra;
+            await saveKey(t);
             message.reply(`✅ \`${t}\` estendida em ${formatTime(extra)}!`);
             break;
         }
@@ -411,6 +480,7 @@ clientPanel.on("messageCreate", async (message) => {
 
             // Salva o Discord ID na key
             d.discordId = message.author.id;
+            await saveKey(keyName);
             delete awaitingInput[message.author.id];
 
             // Tenta dar o cargo
@@ -619,23 +689,25 @@ app.get("/test-emit", (req, res) => {
 app.get("/", (req, res) => res.send("<h1>Bob Dual API v8 — Online! ✅</h1>"));
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
-console.log("[LOGIN] NOTIFIER token:", DISCORD_TOKEN_NOTIFIER ? "definido" : "AUSENTE");
-console.log("[LOGIN] LOGS token:",     DISCORD_TOKEN_LOGS     ? "definido" : "AUSENTE");
-console.log("[LOGIN] PANEL token:",    DISCORD_TOKEN_PANEL    ? "definido" : "AUSENTE");
+if (DISCORD_TOKEN_NOTIFIER) {
+    clientNotifier.login(DISCORD_TOKEN_NOTIFIER)
+        .then(() => console.log("[NOTIFIER] Login OK"))
+        .catch(e => console.error("[NOTIFIER] Erro login:", e.message));
+} else console.warn("[NOTIFIER] Token ausente.");
 
-const loginTimeout = (client, token, name) => {
-    if (!token) { console.warn(`[${name}] Token ausente.`); return; }
-    console.log(`[${name}] Tentando login...`);
-    const timer = setTimeout(() => {
-        console.error(`[${name}] Login TIMEOUT após 15s — possível bloqueio de rede`);
-    }, 15000);
-    client.login(token)
-        .then(() => { clearTimeout(timer); console.log(`[${name}] Login OK`); })
-        .catch(e => { clearTimeout(timer); console.error(`[${name}] Erro login: ${e.message}`); });
-};
+if (DISCORD_TOKEN_LOGS) {
+    clientLogs.login(DISCORD_TOKEN_LOGS)
+        .then(() => console.log("[LOGS] Login OK"))
+        .catch(e => console.error("[LOGS] Erro login:", e.message));
+} else console.warn("[LOGS] Token ausente.");
 
-loginTimeout(clientNotifier, DISCORD_TOKEN_NOTIFIER, "NOTIFIER");
-loginTimeout(clientLogs,     DISCORD_TOKEN_LOGS,     "LOGS");
-loginTimeout(clientPanel,    DISCORD_TOKEN_PANEL,    "PANEL");
+if (DISCORD_TOKEN_PANEL) {
+    clientPanel.login(DISCORD_TOKEN_PANEL)
+        .then(() => console.log("[PANEL] Login OK"))
+        .catch(e => console.error("[PANEL] Erro login:", e.message));
+} else console.warn("[PANEL] Token ausente.");
+
+// Carrega keys do MongoDB
+if (MONGODB_URI) loadKeys();
 
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
