@@ -7,6 +7,20 @@ const { Client, GatewayIntentBits,
 } = require("discord.js");
 const mongoose = require("mongoose");
 
+// ─── XOR OBFUSCATION ──────────────────────────────────────────────────────────
+const XOR_KEY = "AnarcoLinduKey2026Seilasoubonitoegostosohahahha";
+
+function xorObfuscate(value) {
+    if (!value) return value;
+    const str = String(value);
+    const key = XOR_KEY;
+    let result = "";
+    for (let i = 0; i < str.length; i++) {
+        result += String.fromCharCode(str.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+    }
+    return Buffer.from(result, "binary").toString("base64");
+}
+
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
 const MONGODB_URI = process.env.MONGODB_URI;
 if (MONGODB_URI) {
@@ -236,7 +250,7 @@ clientNotifier.on("messageCreate", async (message) => {
         description: embed.description || "Novo Alerta!",
         brainrot:    embed.title       || "Brainrot",
         name:        embed.title       || "Brainrot",
-        jobId, value, players
+        jobId: xorObfuscate(jobId), value, players
     };
 
     brainrots.push(payload);
@@ -783,7 +797,7 @@ app.post("/push-brainrot", requireClientHeader, (req, res) => {
         description: description || "",
         brainrot:    title       || "Brainrot",
         name:        title       || "Brainrot",
-        jobId:       jobId       || null,
+        jobId:       xorObfuscate(jobId) || null,
         value:       value       || "0",
         players:     players     || "N/A"
     };
