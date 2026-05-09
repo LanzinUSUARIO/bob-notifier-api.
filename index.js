@@ -1205,7 +1205,7 @@ app.get("/validate", requireClientHeader, (req, res) => {
     const r = checkKey(key, secret, hwid);
     console.log(`[VALIDATE] resultado: ${r.ok ? "OK" : r.error}`);
     if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
-    const timeLeft = r.data.expiry === Infinity ? Infinity : r.data.expiry - Date.now();
+    const timeLeft = r.data.expiry === Infinity ? 9999999999999 : r.data.expiry - Date.now();
     res.json({ status: "success", time_left: timeLeft });
 });
 
