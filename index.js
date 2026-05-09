@@ -1,9 +1,11 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const { Client, GatewayIntentBits,
+const {
+    Client, GatewayIntentBits,
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
-    EmbedBuilder, Events, ChannelType, Partials
+    EmbedBuilder, Events, ChannelType, Partials,
+    ModalBuilder, TextInputBuilder, TextInputStyle
 } = require("discord.js");
 const mongoose = require("mongoose");
 
@@ -46,7 +48,6 @@ async function loadKeys() {
         const docs = await KeyModel.find({});
         let expired = 0;
         for (const d of docs) {
-            // Já remove expiradas ao carregar
             if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) {
                 await KeyModel.deleteOne({ name: d.name });
                 expired++;
@@ -96,7 +97,7 @@ setInterval(async () => {
             console.log(`[CLEANUP] Key expirada removida: ${name}`);
         }
     }
-}, 60000); // roda a cada 1 minuto
+}, 60000);
 
 // ─── EXPRESS + SOCKET.IO ──────────────────────────────────────────────────────
 const app = express();
@@ -112,16 +113,18 @@ const io = new Server(server, {
 const port = process.env.PORT || 3000;
 
 // ─── ENV VARS ─────────────────────────────────────────────────────────────────
-const ADMIN_PASS    = process.env.ADMIN_PASS    || "ADMIN_PADRAO_MUDE_NO_RENDER";
-const SCRIPT_SECRET = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
-const CLIENT_HEADER = process.env.CLIENT_HEADER || "BobJoiner-v2";
+const ADMIN_PASS         = process.env.ADMIN_PASS    || "ADMIN_PADRAO_MUDE_NO_RENDER";
+const SCRIPT_SECRET      = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
+const CLIENT_HEADER      = process.env.CLIENT_HEADER || "BobJoiner-v2";
 
 const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
 const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL;
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
-const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "1502373185125875873"; // ← ATUALIZADO
+const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "1502373185125875873";
 const LOGS_CHANNEL_ID        = process.env.LOGS_CHANNEL_ID    || "";
+// ID do canal onde o painel do Bob Logs será enviado
+const BOB_LOGS_PANEL_CHANNEL = process.env.BOB_LOGS_PANEL_CHANNEL || "";
 const SCRIPT_URL             = process.env.SCRIPT_URL         || "";
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
@@ -129,8 +132,6 @@ const keys      = {};
 const brainrots = [];
 const presence  = {};
 const kicked    = {};
-
-// ─── Mapa de jobIds por usuário Roblox (name → jobId) ─────────────────────────
 const userJobIds = {};
 
 // ─── RATE LIMITER ─────────────────────────────────────────────────────────────
@@ -165,30 +166,24 @@ async function logSecurityAlert(message) {
 function rateLimitMiddleware(req, res, next) {
     const openRoutes = ["/health", "/"];
     if (openRoutes.includes(req.path)) return next();
-
     const ip  = getRealIP(req);
     const now = Date.now();
-
     if (blockedIPs[ip] && now < blockedIPs[ip]) {
         const remaining = Math.ceil((blockedIPs[ip] - now) / 1000);
         return res.status(429).json({ status: "error", message: `IP bloqueado. Tente em ${remaining}s.` });
     }
     if (blockedIPs[ip]) delete blockedIPs[ip];
-
     if (!rateLimitMap[ip] || now - rateLimitMap[ip].windowStart > RATE_LIMIT_WINDOW) {
         rateLimitMap[ip] = { count: 1, windowStart: now };
         return next();
     }
-
     rateLimitMap[ip].count++;
-
     if (rateLimitMap[ip].count > RATE_LIMIT_MAX) {
         blockedIPs[ip] = now + BLOCK_DURATION;
         console.warn(`[SECURITY] IP bloqueado: ${ip}`);
         logSecurityAlert(`🔴 IP \`${ip}\` bloqueado por rate limit (${rateLimitMap[ip].count} req/60s)`);
         return res.status(429).json({ status: "error", message: "Muitas requisições. IP bloqueado por 5 minutos." });
     }
-
     next();
 }
 
@@ -238,9 +233,6 @@ const checkKey = (key, secret, hwid) => {
 };
 
 // ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
-// ℹ️ O Bob Notifier ainda é necessário se você usa um canal do Discord para
-//    receber alertas de brainrots via embed. Se os brainrots chegam SOMENTE
-//    via POST /push-brainrot, pode remover o token DISCORD_TOKEN_NOTIFIER.
 const clientNotifier = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -284,7 +276,9 @@ clientNotifier.on("messageCreate", async (message) => {
     console.log(`[NOTIFIER] ✅ ${payload.title} | jobId: ${jobId}`);
 });
 
-// ─── BOT LOGS ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── BOB LOGS — PAINEL COM BOTÕES ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 const clientLogs = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -293,72 +287,715 @@ const clientLogs = new Client({
     ]
 });
 
-clientLogs.on("ready", () => console.log(`[LOGS] Online: ${clientLogs.user.tag}`));
+clientLogs.on("ready", async () => {
+    console.log(`[LOGS] Online: ${clientLogs.user.tag}`);
+    await sendLogsPanel();
+});
 
+// ── Constrói o embed do painel de administração ───────────────────────────────
+function buildLogsEmbed() {
+    return new EmbedBuilder()
+        .setTitle("🛠️ Bob Logs — Painel de Administração")
+        .setColor(0x5865F2)
+        .setDescription(
+            "Painel completo de controle do **Bob Joiner**.\n" +
+            "Use os botões abaixo para gerenciar keys, monitorar usuários e administrar o sistema.\n\n" +
+            "**Categorias disponíveis:**\n" +
+            "🔑 **Gerenciar Keys** — criar, revogar, pausar, resetar\n" +
+            "⏱️ **Tempo** — addtime, setexpiry, extend\n" +
+            "📊 **Informações** — online, stats, lookup, jobids\n" +
+            "🛡️ **Segurança** — blocked, unblock\n" +
+            "🧹 **Utilitários** — cleanlogs, test, online ao vivo"
+        )
+        .setFooter({ text: "Bob Joiner Admin Panel • Todos os comandos requerem senha de admin" })
+        .setTimestamp();
+}
+
+// ── Linhas de botões do painel de logs ───────────────────────────────────────
+function buildLogsRows() {
+    // Linha 1 — Keys
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("logs_create").setLabel("Criar Key").setEmoji("🔑").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("logs_lifetime").setLabel("Lifetime").setEmoji("♾️").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("logs_revoke").setLabel("Revogar").setEmoji("🗑️").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("logs_pause").setLabel("Pausar").setEmoji("⏸️").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("logs_reset").setLabel("Reset HWID").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
+    );
+    // Linha 2 — Tempo
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("logs_addtime").setLabel("Add Tempo").setEmoji("⏱️").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("logs_setexpiry").setLabel("Set Expiração").setEmoji("📅").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("logs_extend").setLabel("Extend").setEmoji("➕").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("logs_transfer").setLabel("Transfer Key").setEmoji("🔀").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("logs_sethwid").setLabel("Set HWID").setEmoji("💻").setStyle(ButtonStyle.Secondary),
+    );
+    // Linha 3 — Info
+    const row3 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("logs_online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("logs_stoponline").setLabel("Stop Online").setEmoji("⏹️").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("logs_stats").setLabel("Stats").setEmoji("📊").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("logs_info").setLabel("Listar Keys").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("logs_lookup").setLabel("Lookup").setEmoji("🔍").setStyle(ButtonStyle.Secondary),
+    );
+    // Linha 4 — Segurança / Utilitários
+    const row4 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("logs_jobids").setLabel("JobIDs").setEmoji("🎮").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("logs_blocked").setLabel("IPs Bloqueados").setEmoji("🔒").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("logs_unblock").setLabel("Desbloquear IP").setEmoji("🔓").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("logs_cleanlogs").setLabel("Limpar Logs").setEmoji("🧹").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("logs_test").setLabel("Teste").setEmoji("🧪").setStyle(ButtonStyle.Secondary),
+    );
+
+    return [row1, row2, row3, row4];
+}
+
+// ── Envia (ou reenvia) o painel no canal BOB_LOGS_PANEL_CHANNEL ───────────────
+async function sendLogsPanel() {
+    const channelId = BOB_LOGS_PANEL_CHANNEL || LOGS_CHANNEL_ID;
+    if (!channelId) return;
+    try {
+        const ch = await clientLogs.channels.fetch(channelId);
+        if (!ch) return;
+        const msgs = await ch.messages.fetch({ limit: 20 });
+        for (const [, msg] of msgs) {
+            if (msg.author.id === clientLogs.user.id) await msg.delete().catch(() => {});
+        }
+        await ch.send({ embeds: [buildLogsEmbed()], components: buildLogsRows() });
+        console.log("[LOGS] Painel enviado no canal!");
+    } catch (e) {
+        console.error("[LOGS] Erro ao enviar painel:", e.message);
+    }
+}
+
+// ── Helper: constrói embed !online ────────────────────────────────────────────
+function buildOnlineEmbed() {
+    const now = Date.now();
+    for (const [sid, info] of Object.entries(presence)) {
+        if (now - info.lastSeen >= 30000) delete presence[sid];
+    }
+    const userMap = {};
+    for (const [, info] of Object.entries(presence)) {
+        if (now - info.lastSeen >= 30000) continue;
+        const robloxName = info.name || "?";
+        if (userMap[robloxName]) continue;
+        const keyName = info.key ? findKey(info.key) : null;
+        const keyData = keyName ? keys[keyName] : null;
+        let timeLeft = "?", status = "✅";
+        if (keyData) {
+            if (keyData.paused) { timeLeft = formatTime(keyData.remaining); status = "⏸️"; }
+            else { timeLeft = keyData.expiry === Infinity ? "Lifetime ♾️" : formatTime(keyData.expiry - now); }
+        }
+        const discordId = keyData?.discordId || null;
+        const jobId = userJobIds[robloxName] || null;
+        userMap[robloxName] = { timeLeft, status, discordId, jobId };
+    }
+    const userList = Object.entries(userMap);
+    const embed = new EmbedBuilder()
+        .setTitle("🟢 Usuários Online no Script")
+        .setColor(0x00C853)
+        .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s` })
+        .setTimestamp();
+    if (userList.length === 0) {
+        embed.setDescription("Nenhum usuário online no momento.");
+    } else {
+        const lines = userList.map(([robloxName, data]) => {
+            const mention = data.discordId ? `<@${data.discordId}>` : "*(sem Discord)*";
+            const jobPart = data.jobId ? ` | 🎮 \`${data.jobId.substring(0, 8)}...\`` : "";
+            return `${data.status} **${robloxName}** — ${mention} — ⏱️ \`${data.timeLeft}\`${jobPart}`;
+        });
+        embed.setDescription(lines.join("\n"));
+    }
+    return embed;
+}
+
+// ── Listener de interações do Bob Logs ───────────────────────────────────────
+clientLogs.on(Events.InteractionCreate, async (interaction) => {
+
+    // ── Modais (respostas de formulários) ─────────────────────────────────────
+    if (interaction.isModalSubmit()) {
+        await handleLogsModal(interaction);
+        return;
+    }
+
+    if (!interaction.isButton()) return;
+    if (!interaction.customId.startsWith("logs_")) return;
+
+    const id = interaction.customId;
+
+    // ── Botões que NÃO precisam de modal (ação imediata) ─────────────────────
+    if (id === "logs_online") {
+        await interaction.deferReply({ ephemeral: false });
+        const sentMsg = await interaction.editReply({ embeds: [buildOnlineEmbed()] });
+
+        if (!global.onlineIntervals) global.onlineIntervals = {};
+        if (global.onlineIntervals[interaction.channelId]) {
+            clearInterval(global.onlineIntervals[interaction.channelId]);
+        }
+        global.onlineIntervals[interaction.channelId] = setInterval(async () => {
+            await sentMsg.edit({ embeds: [buildOnlineEmbed()] }).catch(() => {
+                clearInterval(global.onlineIntervals[interaction.channelId]);
+                delete global.onlineIntervals[interaction.channelId];
+            });
+        }, 5000);
+        return;
+    }
+
+    if (id === "logs_stoponline") {
+        await interaction.deferReply({ ephemeral: true });
+        if (global.onlineIntervals && global.onlineIntervals[interaction.channelId]) {
+            clearInterval(global.onlineIntervals[interaction.channelId]);
+            delete global.onlineIntervals[interaction.channelId];
+            await interaction.editReply({ content: "⏹️ Atualização do online parada." });
+        } else {
+            await interaction.editReply({ content: "Nenhuma atualização ativa neste canal." });
+        }
+        return;
+    }
+
+    if (id === "logs_stats") {
+        await interaction.deferReply({ ephemeral: true });
+        const all    = Object.values(keys);
+        const active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0));
+        const paused = all.filter(k => k.paused);
+        const lt     = all.filter(k => k.expiry === Infinity);
+        const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
+        const embed = new EmbedBuilder()
+            .setTitle("📊 Estatísticas Bob Joiner")
+            .setColor(0x5865F2)
+            .addFields(
+                { name: "🔑 Total de Keys",   value: String(all.length),       inline: true },
+                { name: "✅ Ativas",           value: String(active.length),    inline: true },
+                { name: "⏸️ Pausadas",         value: String(paused.length),    inline: true },
+                { name: "♾️ Lifetime",         value: String(lt.length),        inline: true },
+                { name: "🟢 Online agora",     value: String(online.length),    inline: true },
+                { name: "📡 Brainrots (fila)", value: String(brainrots.length), inline: true }
+            )
+            .setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
+        return;
+    }
+
+    if (id === "logs_info") {
+        await interaction.deferReply({ ephemeral: true });
+        const ks = Object.keys(keys);
+        if (!ks.length) { await interaction.editReply({ content: "Nenhuma chave ativa." }); return; }
+        const embed = new EmbedBuilder().setTitle("🔑 Chaves Ativas").setColor(0x5865F2).setTimestamp();
+        const lines = ks.map(k => {
+            const d = keys[k];
+            const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
+            const discord = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
+            const hwid    = d.hwid ? `HWID: ${d.hwid.substring(0, 6)}...` : "Livre";
+            return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${discord} *(${hwid})*`;
+        });
+        embed.setDescription(lines.join("\n").substring(0, 4000));
+        await interaction.editReply({ embeds: [embed] });
+        return;
+    }
+
+    if (id === "logs_jobids") {
+        await interaction.deferReply({ ephemeral: true });
+        const entries = Object.entries(userJobIds);
+        if (!entries.length) { await interaction.editReply({ content: "Nenhum JobID registrado." }); return; }
+        const lines = entries.map(([name, jobId]) => `• **${name}**: \`${jobId}\``);
+        await interaction.editReply({ content: "🎮 **JobIDs conhecidos:**\n" + lines.join("\n") });
+        return;
+    }
+
+    if (id === "logs_blocked") {
+        await interaction.deferReply({ ephemeral: true });
+        const now = Date.now();
+        const active = Object.entries(blockedIPs).filter(([, until]) => now < until);
+        if (!active.length) { await interaction.editReply({ content: "Nenhum IP bloqueado no momento." }); return; }
+        const lines = active.map(([ip, until]) => `• \`${ip}\` — ainda ${Math.ceil((until - now) / 1000)}s bloqueado`);
+        await interaction.editReply({ content: "🔒 **IPs Bloqueados:**\n" + lines.join("\n") });
+        return;
+    }
+
+    if (id === "logs_test") {
+        await interaction.deferReply({ ephemeral: true });
+        const payload = {
+            id: Date.now().toString(), title: "TESTE", description: "SINAL OK!",
+            brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A"
+        };
+        brainrots.push(payload);
+        io.emit("brainrot", payload);
+        await interaction.editReply({ content: "✅ Brainrot de teste enviado!" });
+        return;
+    }
+
+    // ── Botões que ABREM MODAL ────────────────────────────────────────────────
+    const modalMap = {
+        logs_create:    buildModal_create,
+        logs_lifetime:  buildModal_lifetime,
+        logs_revoke:    buildModal_revoke,
+        logs_pause:     buildModal_pause,
+        logs_reset:     buildModal_reset,
+        logs_addtime:   buildModal_addtime,
+        logs_setexpiry: buildModal_setexpiry,
+        logs_extend:    buildModal_extend,
+        logs_transfer:  buildModal_transfer,
+        logs_sethwid:   buildModal_sethwid,
+        logs_lookup:    buildModal_lookup,
+        logs_unblock:   buildModal_unblock,
+        logs_cleanlogs: buildModal_cleanlogs,
+    };
+
+    if (modalMap[id]) {
+        await interaction.showModal(modalMap[id]());
+    }
+});
+
+// ── Handler de modais submetidos ──────────────────────────────────────────────
+async function handleLogsModal(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    const id = interaction.customId;
+
+    // Helper local para verificar senha
+    const getField = (name) => {
+        try { return interaction.fields.getTextInputValue(name); } catch { return ""; }
+    };
+    const wrongPass = (pass) => pass !== ADMIN_PASS;
+
+    // ── modal_create ──────────────────────────────────────────────────────────
+    if (id === "modal_create") {
+        const name = getField("key_name");
+        const h    = parseInt(getField("key_h"))  || 0;
+        const m    = parseInt(getField("key_m"))  || 0;
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        if (findKey(name))   { await interaction.editReply({ content: `❌ Chave \`${name}\` já existe!` }); return; }
+        const dur = (h * 3600 + m * 60) * 1000;
+        if (dur <= 0) { await interaction.editReply({ content: "❌ Duração inválida!" }); return; }
+        keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
+        await saveKey(name);
+        await interaction.editReply({ content: `✅ Chave \`${name}\` criada! Duração: **${formatTime(dur)}**` });
+        return;
+    }
+
+    // ── modal_lifetime ────────────────────────────────────────────────────────
+    if (id === "modal_lifetime") {
+        const name = getField("key_name");
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
+        await saveKey(name);
+        await interaction.editReply({ content: `✅ Chave \`${name}\` criada como **Lifetime ♾️**!` });
+        return;
+    }
+
+    // ── modal_revoke ──────────────────────────────────────────────────────────
+    if (id === "modal_revoke") {
+        const name = getField("key_name");
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        if (name.toLowerCase() === "all") {
+            const count = Object.keys(keys).length;
+            for (const k of Object.keys(keys)) { delete keys[k]; await deleteKey(k); }
+            await interaction.editReply({ content: `🗑️ **${count} chaves** removidas.` });
+        } else {
+            const t = findKey(name);
+            if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+            delete keys[t];
+            await deleteKey(t);
+            await interaction.editReply({ content: `🗑️ Chave \`${t}\` removida.` });
+        }
+        return;
+    }
+
+    // ── modal_pause ───────────────────────────────────────────────────────────
+    if (id === "modal_pause") {
+        const name = getField("key_name");
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        if (name.toLowerCase() === "all") {
+            let paused = 0, resumed = 0;
+            for (const k of Object.keys(keys)) {
+                const d = keys[k];
+                if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; resumed++; }
+                else { d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; paused++; }
+                await saveKey(k);
+            }
+            await interaction.editReply({ content: `⏸️ **${paused}** pausadas, **${resumed}** retomadas.` });
+        } else {
+            const t = findKey(name);
+            if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+            const d = keys[t];
+            if (d.paused) {
+                d.expiry = Date.now() + d.remaining; d.paused = false; await saveKey(t);
+                await interaction.editReply({ content: `▶️ \`${t}\` retomada! Tempo: **${formatTime(d.remaining)}**` });
+            } else {
+                d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; await saveKey(t);
+                await interaction.editReply({ content: `⏸️ \`${t}\` pausada! Tempo salvo: **${formatTime(d.remaining)}**` });
+            }
+        }
+        return;
+    }
+
+    // ── modal_reset ───────────────────────────────────────────────────────────
+    if (id === "modal_reset") {
+        const name = getField("key_name");
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        if (name.toLowerCase() === "all") {
+            let count = 0;
+            for (const k of Object.keys(keys)) { keys[k].hwid = null; kicked[k.toLowerCase()] = Date.now(); await saveKey(k); count++; }
+            await interaction.editReply({ content: `✅ HWID de **${count} chaves** resetado!` });
+        } else {
+            const t = findKey(name);
+            if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+            keys[t].hwid = null; kicked[t.toLowerCase()] = Date.now(); await saveKey(t);
+            await interaction.editReply({ content: `✅ HWID de \`${t}\` resetado!` });
+        }
+        return;
+    }
+
+    // ── modal_addtime ─────────────────────────────────────────────────────────
+    if (id === "modal_addtime") {
+        const name  = getField("key_name");
+        const h     = parseInt(getField("key_h")) || 0;
+        const m     = parseInt(getField("key_m")) || 0;
+        const pass  = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        const extra = (h * 3600 + m * 60) * 1000;
+        if (extra <= 0) { await interaction.editReply({ content: "❌ Tempo inválido!" }); return; }
+        if (name.toLowerCase() === "all") {
+            let count = 0;
+            for (const k of Object.keys(keys)) {
+                const d = keys[k];
+                if (d.paused) d.remaining += extra;
+                else if (d.expiry !== Infinity) d.expiry += extra;
+                await saveKey(k); count++;
+            }
+            await interaction.editReply({ content: `✅ **${formatTime(extra)}** adicionado a **${count} chaves**!` });
+        } else {
+            const t = findKey(name);
+            if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+            const d = keys[t];
+            if (d.paused) d.remaining += extra;
+            else if (d.expiry !== Infinity) d.expiry += extra;
+            await saveKey(t);
+            await interaction.editReply({ content: `✅ **${formatTime(extra)}** adicionado a \`${t}\`!` });
+        }
+        return;
+    }
+
+    // ── modal_setexpiry ───────────────────────────────────────────────────────
+    if (id === "modal_setexpiry") {
+        const name = getField("key_name");
+        const h    = parseInt(getField("key_h")) || 0;
+        const m    = parseInt(getField("key_m")) || 0;
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        const t = findKey(name);
+        if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+        const dur = (h * 3600 + m * 60) * 1000;
+        if (dur <= 0) { await interaction.editReply({ content: "❌ Duração inválida!" }); return; }
+        const d = keys[t];
+        if (d.paused) { d.remaining = dur; }
+        else { d.expiry = Date.now() + dur; d.remaining = dur; }
+        await saveKey(t);
+        await interaction.editReply({ content: `✅ Expiração de \`${t}\` redefinida para **${formatTime(dur)}**!` });
+        return;
+    }
+
+    // ── modal_extend ──────────────────────────────────────────────────────────
+    if (id === "modal_extend") {
+        const name = getField("key_name");
+        const h    = parseInt(getField("key_h")) || 0;
+        const m    = parseInt(getField("key_m")) || 0;
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        const t = findKey(name);
+        if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+        const extra = (h * 3600 + m * 60) * 1000;
+        const d = keys[t];
+        if (d.paused) d.remaining += extra;
+        else if (d.expiry !== Infinity) d.expiry += extra;
+        await saveKey(t);
+        await interaction.editReply({ content: `✅ \`${t}\` estendida em **${formatTime(extra)}**!` });
+        return;
+    }
+
+    // ── modal_transfer ────────────────────────────────────────────────────────
+    if (id === "modal_transfer") {
+        const oldName = getField("key_old");
+        const newName = getField("key_new");
+        const pass    = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        const t = findKey(oldName);
+        if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+        if (findKey(newName)) { await interaction.editReply({ content: `❌ Chave \`${newName}\` já existe!` }); return; }
+        keys[newName] = { ...keys[t] };
+        delete keys[t];
+        await deleteKey(t);
+        await saveKey(newName);
+        await interaction.editReply({ content: `✅ Chave transferida de \`${t}\` para \`${newName}\`!` });
+        return;
+    }
+
+    // ── modal_sethwid ─────────────────────────────────────────────────────────
+    if (id === "modal_sethwid") {
+        const name = getField("key_name");
+        const hwid = getField("key_hwid");
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        const t = findKey(name);
+        if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+        keys[t].hwid = hwid;
+        await saveKey(t);
+        await interaction.editReply({ content: `✅ HWID de \`${t}\` definido para \`${hwid}\`!` });
+        return;
+    }
+
+    // ── modal_lookup ──────────────────────────────────────────────────────────
+    if (id === "modal_lookup") {
+        const name = getField("key_name");
+        const t = findKey(name);
+        if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
+        const d = keys[t];
+        const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
+        const status   = d.paused ? "⏸️ Pausada" : "✅ Ativa";
+        const hwid     = d.hwid ? `\`${d.hwid.substring(0, 12)}...\`` : "Nenhum (Livre)";
+        const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
+        const jobId    = d.discordId ? (userJobIds[d.discordId] || "Nenhum") : "Nenhum";
+        const embed = new EmbedBuilder()
+            .setTitle(`🔍 Info: ${t}`)
+            .setColor(d.paused ? 0xFFA000 : 0x00C853)
+            .addFields(
+                { name: "⏱️ Tempo Restante", value: timeLeft,       inline: true },
+                { name: "📌 Status",          value: status,         inline: true },
+                { name: "💻 HWID",            value: hwid,           inline: false },
+                { name: "👤 Discord",          value: discord,        inline: true },
+                { name: "🎮 JobID",            value: String(jobId),  inline: true }
+            )
+            .setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
+        return;
+    }
+
+    // ── modal_unblock ─────────────────────────────────────────────────────────
+    if (id === "modal_unblock") {
+        const ip   = getField("ip_address");
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        if (blockedIPs[ip]) { delete blockedIPs[ip]; await interaction.editReply({ content: `✅ IP \`${ip}\` desbloqueado.` }); }
+        else await interaction.editReply({ content: "IP não estava bloqueado." });
+        return;
+    }
+
+    // ── modal_cleanlogs ───────────────────────────────────────────────────────
+    if (id === "modal_cleanlogs") {
+        const pass = getField("key_pass");
+        if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        const count = brainrots.length;
+        brainrots.length = 0;
+        await interaction.editReply({ content: `🧹 **${count}** brainrots removidos da fila.` });
+        return;
+    }
+}
+
+// ── Builders de Modal ─────────────────────────────────────────────────────────
+
+function buildModal_create() {
+    return new ModalBuilder().setCustomId("modal_create").setTitle("🔑 Criar Key")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_h").setLabel("Horas").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 24")
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_m").setLabel("Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 0")
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_lifetime() {
+    return new ModalBuilder().setCustomId("modal_lifetime").setTitle("♾️ Criar Key Lifetime")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_revoke() {
+    return new ModalBuilder().setCustomId("modal_revoke").setTitle("🗑️ Revogar Key")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_pause() {
+    return new ModalBuilder().setCustomId("modal_pause").setTitle("⏸️ Pausar / Retomar Key")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_reset() {
+    return new ModalBuilder().setCustomId("modal_reset").setTitle("🔄 Resetar HWID")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_addtime() {
+    return new ModalBuilder().setCustomId("modal_addtime").setTitle("⏱️ Adicionar Tempo")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 12")
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 30")
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_setexpiry() {
+    return new ModalBuilder().setCustomId("modal_setexpiry").setTitle("📅 Redefinir Expiração")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_h").setLabel("Novo tempo — Horas").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_m").setLabel("Novo tempo — Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_extend() {
+    return new ModalBuilder().setCustomId("modal_extend").setTitle("➕ Estender Key")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_transfer() {
+    return new ModalBuilder().setCustomId("modal_transfer").setTitle("🔀 Transferir Key")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_old").setLabel("Nome atual da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_new").setLabel("Novo nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_sethwid() {
+    return new ModalBuilder().setCustomId("modal_sethwid").setTitle("💻 Definir HWID")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_hwid").setLabel("Novo HWID").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_lookup() {
+    return new ModalBuilder().setCustomId("modal_lookup").setTitle("🔍 Lookup Key")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_unblock() {
+    return new ModalBuilder().setCustomId("modal_unblock").setTitle("🔓 Desbloquear IP")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("ip_address").setLabel("Endereço IP").setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+function buildModal_cleanlogs() {
+    return new ModalBuilder().setCustomId("modal_cleanlogs").setTitle("🧹 Limpar Logs")
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
+            )
+        );
+}
+
+// ── Comandos de texto como fallback (ainda funcionam) ─────────────────────────
 clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
-    if (!message.content.startsWith("!")) return;
 
+    // Reenvia o painel ao digitar !logspanel
+    if (message.content === "!logspanel") {
+        await sendLogsPanel();
+        return;
+    }
+
+    if (!message.content.startsWith("!")) return;
     const args = message.content.slice(1).trim().split(/ +/);
     const cmd  = args.shift().toLowerCase();
-
-    // ── Helper: verifica senha ──────────────────────────────────────────────
     const wrongPass = (pass) => pass !== ADMIN_PASS;
 
     switch (cmd) {
-
-        // ══════════════════════════════════════════════════════════════════
-        // !online — atualiza sem limite de tempo (para com !stoponline)
-        // ══════════════════════════════════════════════════════════════════
         case "online": {
-            const buildOnlineEmbed = () => {
-                const now = Date.now();
-                for (const [sid, info] of Object.entries(presence)) {
-                    if (now - info.lastSeen >= 30000) delete presence[sid];
-                }
-                const userMap = {};
-                for (const [, info] of Object.entries(presence)) {
-                    if (now - info.lastSeen >= 30000) continue;
-                    const robloxName = info.name || "?";
-                    if (userMap[robloxName]) continue;
-                    const keyName = info.key ? findKey(info.key) : null;
-                    const keyData = keyName ? keys[keyName] : null;
-                    let timeLeft = "?", status = "✅";
-                    if (keyData) {
-                        if (keyData.paused) { timeLeft = formatTime(keyData.remaining); status = "⏸️"; }
-                        else { timeLeft = keyData.expiry === Infinity ? "Lifetime ♾️" : formatTime(keyData.expiry - now); }
-                    }
-                    const discordId = keyData?.discordId || null;
-                    const jobId = userJobIds[robloxName] || null;
-                    userMap[robloxName] = { timeLeft, status, discordId, jobId };
-                }
-                const userList = Object.entries(userMap);
-                const embed = new EmbedBuilder()
-                    .setTitle("🟢 Usuários Online no Script")
-                    .setColor(0x00C853)
-                    .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s • Digite !stoponline para parar` })
-                    .setTimestamp();
-                if (userList.length === 0) {
-                    embed.setDescription("Nenhum usuário online no momento.");
-                } else {
-                    const lines = userList.map(([robloxName, data]) => {
-                        const mention  = data.discordId ? `<@${data.discordId}>` : "*(sem Discord)*";
-                        const jobPart  = data.jobId ? ` | 🎮 \`${data.jobId.substring(0,8)}...\`` : "";
-                        return `${data.status} **${robloxName}** — ${mention} — ⏱️ \`${data.timeLeft}\`${jobPart}`;
-                    });
-                    embed.setDescription(lines.join("\n"));
-                }
-                return embed;
-            };
-
             const sentMsg = await message.reply({ embeds: [buildOnlineEmbed()] });
-
-            // Guarda o interval no mapa para poder parar depois
             if (!global.onlineIntervals) global.onlineIntervals = {};
-            if (global.onlineIntervals[message.channel.id]) {
-                clearInterval(global.onlineIntervals[message.channel.id]);
-            }
-
+            if (global.onlineIntervals[message.channel.id]) clearInterval(global.onlineIntervals[message.channel.id]);
             global.onlineIntervals[message.channel.id] = setInterval(async () => {
                 await sentMsg.edit({ embeds: [buildOnlineEmbed()] }).catch(() => {
                     clearInterval(global.onlineIntervals[message.channel.id]);
@@ -367,36 +1004,21 @@ clientLogs.on("messageCreate", async (message) => {
             }, 5000);
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !stoponline — para atualização do !online neste canal
-        // ══════════════════════════════════════════════════════════════════
         case "stoponline": {
             if (global.onlineIntervals && global.onlineIntervals[message.channel.id]) {
                 clearInterval(global.onlineIntervals[message.channel.id]);
                 delete global.onlineIntervals[message.channel.id];
                 message.reply("⏹️ Atualização do !online parada.");
-            } else {
-                message.reply("Nenhuma atualização ativa neste canal.");
-            }
+            } else message.reply("Nenhuma atualização ativa neste canal.");
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !blocked — lista IPs bloqueados
-        // ══════════════════════════════════════════════════════════════════
         case "blocked": {
             const now = Date.now();
             const active = Object.entries(blockedIPs).filter(([, until]) => now < until);
-            if (!active.length) { message.reply("Nenhum IP bloqueado no momento."); break; }
-            const lines = active.map(([ip, until]) => `• \`${ip}\` — ainda ${Math.ceil((until - now)/1000)}s bloqueado`);
-            message.reply("🔒 **IPs Bloqueados:**\n" + lines.join("\n"));
+            if (!active.length) { message.reply("Nenhum IP bloqueado."); break; }
+            message.reply("🔒 **IPs Bloqueados:**\n" + active.map(([ip, u]) => `• \`${ip}\` — ${Math.ceil((u - now) / 1000)}s`).join("\n"));
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !unblock <ip> <senha>
-        // ══════════════════════════════════════════════════════════════════
         case "unblock": {
             const [ip, pass] = args;
             if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
@@ -404,411 +1026,74 @@ clientLogs.on("messageCreate", async (message) => {
             else message.reply("IP não estava bloqueado.");
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !test — brainrot de teste
-        // ══════════════════════════════════════════════════════════════════
         case "test": {
-            const payload = {
-                id: Date.now().toString(), title: "TESTE", description: "SINAL OK!",
-                brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A"
-            };
-            brainrots.push(payload);
-            io.emit("brainrot", payload);
+            const p = { id: Date.now().toString(), title: "TESTE", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A" };
+            brainrots.push(p); io.emit("brainrot", p);
             message.reply("✅ Teste enviado!");
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !info — lista todas as keys
-        // ══════════════════════════════════════════════════════════════════
-        case "info": {
-            const ks = Object.keys(keys);
-            if (!ks.length) { message.reply("Nenhuma chave ativa."); break; }
-            const embed = new EmbedBuilder()
-                .setTitle("🔑 Chaves Ativas")
-                .setColor(0x5865F2)
-                .setTimestamp();
-            const lines = ks.map(k => {
-                const d = keys[k];
-                const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
-                const discord = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
-                const hwid    = d.hwid ? `HWID: ${d.hwid.substring(0,6)}...` : "Livre";
-                return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${discord} *(${hwid})*`;
-            });
-            embed.setDescription(lines.join("\n"));
-            message.reply({ embeds: [embed] });
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !create <h> <m> <nome> <senha>
-        // ══════════════════════════════════════════════════════════════════
-        case "create": {
-            if (args.length < 4) { message.reply("Uso: `!create <h> <m> <nome> <senha>`"); break; }
-            const [h, m, name, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            if (findKey(name)) { message.reply(`❌ Chave \`${name}\` já existe!`); break; }
-            const dur = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
-            if (dur <= 0) { message.reply("❌ Duração inválida!"); break; }
-            keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
-            await saveKey(name);
-            message.reply(`✅ Chave \`${name}\` criada! Duração: **${formatTime(dur)}**`);
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !lifetime <nome> <senha>
-        // ══════════════════════════════════════════════════════════════════
-        case "lifetime": {
-            const [name, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
-            await saveKey(name);
-            message.reply(`✅ Chave \`${name}\` criada como **Lifetime ♾️**!`);
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !reset <nome|all> <senha>  — reseta HWID
-        // ══════════════════════════════════════════════════════════════════
-        case "reset": {
-            const [name, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            if (name.toLowerCase() === "all") {
-                let count = 0;
-                for (const k of Object.keys(keys)) {
-                    keys[k].hwid = null;
-                    kicked[k.toLowerCase()] = Date.now();
-                    await saveKey(k);
-                    count++;
-                }
-                message.reply(`✅ HWID de **${count} chaves** resetado!`);
-            } else {
-                const t = findKey(name);
-                if (!t) { message.reply("❌ Chave não encontrada."); break; }
-                keys[t].hwid = null;
-                kicked[t.toLowerCase()] = Date.now();
-                await saveKey(t);
-                message.reply(`✅ HWID de \`${t}\` resetado!`);
-            }
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !pause <nome|all> <senha>  — pausa/retoma
-        // ══════════════════════════════════════════════════════════════════
-        case "pause": {
-            const [name, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            if (name.toLowerCase() === "all") {
-                let paused = 0, resumed = 0;
-                for (const k of Object.keys(keys)) {
-                    const d = keys[k];
-                    if (d.paused) {
-                        d.expiry = Date.now() + d.remaining; d.paused = false; resumed++;
-                    } else {
-                        d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
-                        d.paused = true; paused++;
-                    }
-                    await saveKey(k);
-                }
-                message.reply(`⏸️ **${paused}** chaves pausadas, **${resumed}** retomadas.`);
-            } else {
-                const t = findKey(name);
-                if (!t) { message.reply("❌ Chave não encontrada."); break; }
-                const d = keys[t];
-                if (d.paused) {
-                    d.expiry = Date.now() + d.remaining; d.paused = false;
-                    await saveKey(t);
-                    message.reply(`▶️ \`${t}\` retomada! Tempo restante: **${formatTime(d.remaining)}**`);
-                } else {
-                    d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
-                    d.paused = true;
-                    await saveKey(t);
-                    message.reply(`⏸️ \`${t}\` pausada! Tempo salvo: **${formatTime(d.remaining)}**`);
-                }
-            }
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !revoke <nome|all> <senha>
-        // ══════════════════════════════════════════════════════════════════
-        case "revoke": {
-            const [name, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            if (name.toLowerCase() === "all") {
-                const count = Object.keys(keys).length;
-                for (const k of Object.keys(keys)) {
-                    delete keys[k];
-                    await deleteKey(k);
-                }
-                message.reply(`🗑️ **${count} chaves** removidas.`);
-            } else {
-                const t = findKey(name);
-                if (!t) { message.reply("❌ Chave não encontrada."); break; }
-                delete keys[t];
-                await deleteKey(t);
-                message.reply(`🗑️ Chave \`${t}\` removida.`);
-            }
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !extend <nome> <h> <m> <senha>
-        // ══════════════════════════════════════════════════════════════════
-        case "extend": {
-            if (args.length < 4) { message.reply("Uso: `!extend <nome> <h> <m> <senha>`"); break; }
-            const [name, h, m, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            const extra = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
-            const d = keys[t];
-            if (d.paused) d.remaining += extra;
-            else if (d.expiry !== Infinity) d.expiry += extra;
-            await saveKey(t);
-            message.reply(`✅ \`${t}\` estendida em **${formatTime(extra)}**!`);
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !addtime <nome|all> <h> <m> <senha>  — igual ao extend mas suporta "all"
-        // ══════════════════════════════════════════════════════════════════
-        case "addtime": {
-            if (args.length < 4) { message.reply("Uso: `!addtime <nome|all> <h> <m> <senha>`"); break; }
-            const [name, h, m, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            const extra = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
-            if (extra <= 0) { message.reply("❌ Tempo inválido!"); break; }
-            if (name.toLowerCase() === "all") {
-                let count = 0;
-                for (const k of Object.keys(keys)) {
-                    const d = keys[k];
-                    if (d.paused) d.remaining += extra;
-                    else if (d.expiry !== Infinity) d.expiry += extra;
-                    await saveKey(k);
-                    count++;
-                }
-                message.reply(`✅ **${formatTime(extra)}** adicionado a **${count} chaves**!`);
-            } else {
-                const t = findKey(name);
-                if (!t) { message.reply("❌ Chave não encontrada."); break; }
-                const d = keys[t];
-                if (d.paused) d.remaining += extra;
-                else if (d.expiry !== Infinity) d.expiry += extra;
-                await saveKey(t);
-                message.reply(`✅ **${formatTime(extra)}** adicionado a \`${t}\`!`);
-            }
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !setexpiry <nome> <h> <m> <senha>  — redefine o tempo da key
-        // ══════════════════════════════════════════════════════════════════
-        case "setexpiry": {
-            if (args.length < 4) { message.reply("Uso: `!setexpiry <nome> <h> <m> <senha>`"); break; }
-            const [name, h, m, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            const dur = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
-            if (dur <= 0) { message.reply("❌ Duração inválida!"); break; }
-            const d = keys[t];
-            if (d.paused) { d.remaining = dur; }
-            else { d.expiry = Date.now() + dur; d.remaining = dur; }
-            await saveKey(t);
-            message.reply(`✅ Expiração de \`${t}\` redefinida para **${formatTime(dur)}**!`);
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !sethwid <nome> <hwid> <senha>  — força um HWID manualmente
-        // ══════════════════════════════════════════════════════════════════
-        case "sethwid": {
-            if (args.length < 3) { message.reply("Uso: `!sethwid <nome> <hwid> <senha>`"); break; }
-            const [name, hwid, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            keys[t].hwid = hwid;
-            await saveKey(t);
-            message.reply(`✅ HWID de \`${t}\` definido para \`${hwid}\`!`);
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !transfer <nomeAntigo> <nomeNovo> <senha>  — renomeia uma key
-        // ══════════════════════════════════════════════════════════════════
-        case "transfer": {
-            if (args.length < 3) { message.reply("Uso: `!transfer <nomeAntigo> <nomeNovo> <senha>`"); break; }
-            const [oldName, newName, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(oldName);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            if (findKey(newName)) { message.reply(`❌ Chave \`${newName}\` já existe!`); break; }
-            keys[newName] = { ...keys[t] };
-            delete keys[t];
-            await deleteKey(t);
-            await saveKey(newName);
-            message.reply(`✅ Chave transferida de \`${t}\` para \`${newName}\`!`);
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !lookup <nome>  — info detalhada de uma key (sem precisar de senha)
-        // ══════════════════════════════════════════════════════════════════
-        case "lookup": {
-            const [name] = args;
-            if (!name) { message.reply("Uso: `!lookup <nome>`"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            const d = keys[t];
-            const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
-            const status   = d.paused ? "⏸️ Pausada" : "✅ Ativa";
-            const hwid     = d.hwid ? `\`${d.hwid.substring(0,12)}...\`` : "Nenhum (Livre)";
-            const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
-            const jobId    = d.discordId ? (userJobIds[d.discordId] || "Nenhum") : "Nenhum";
-            const embed = new EmbedBuilder()
-                .setTitle(`🔍 Info: ${t}`)
-                .setColor(d.paused ? 0xFFA000 : 0x00C853)
-                .addFields(
-                    { name: "⏱️ Tempo Restante", value: timeLeft,  inline: true  },
-                    { name: "📌 Status",          value: status,    inline: true  },
-                    { name: "💻 HWID",            value: hwid,      inline: false },
-                    { name: "👤 Discord",          value: discord,   inline: true  },
-                    { name: "🎮 JobID",            value: String(jobId), inline: true }
-                )
-                .setTimestamp();
-            message.reply({ embeds: [embed] });
-            break;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !stats  — estatísticas gerais
-        // ══════════════════════════════════════════════════════════════════
         case "stats": {
             const all    = Object.values(keys);
             const active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0));
             const paused = all.filter(k => k.paused);
             const lt     = all.filter(k => k.expiry === Infinity);
             const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
-            const embed = new EmbedBuilder()
-                .setTitle("📊 Estatísticas Bob Joiner")
-                .setColor(0x5865F2)
+            const embed = new EmbedBuilder().setTitle("📊 Estatísticas Bob Joiner").setColor(0x5865F2)
                 .addFields(
-                    { name: "🔑 Total de Keys",   value: String(all.length),    inline: true },
-                    { name: "✅ Ativas",           value: String(active.length), inline: true },
-                    { name: "⏸️ Pausadas",         value: String(paused.length), inline: true },
-                    { name: "♾️ Lifetime",         value: String(lt.length),     inline: true },
-                    { name: "🟢 Online agora",     value: String(online.length), inline: true },
-                    { name: "📡 Brainrots (fila)", value: String(brainrots.length), inline: true }
-                )
-                .setTimestamp();
+                    { name: "🔑 Total",   value: String(all.length),       inline: true },
+                    { name: "✅ Ativas",  value: String(active.length),    inline: true },
+                    { name: "⏸️ Pausadas",value: String(paused.length),    inline: true },
+                    { name: "♾️ Lifetime",value: String(lt.length),        inline: true },
+                    { name: "🟢 Online",  value: String(online.length),    inline: true },
+                    { name: "📡 Brainrots",value: String(brainrots.length),inline: true }
+                ).setTimestamp();
             message.reply({ embeds: [embed] });
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !kick <nome|all> <senha>  — força desconexão (via HWID reset + kicked flag)
-        // ══════════════════════════════════════════════════════════════════
-        case "kick": {
-            const [name, pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            if (name.toLowerCase() === "all") {
-                let count = 0;
-                for (const k of Object.keys(keys)) {
-                    kicked[k.toLowerCase()] = Date.now();
-                    count++;
-                }
-                message.reply(`👢 **${count} usuários** marcados para kick!`);
-            } else {
-                const t = findKey(name);
-                if (!t) { message.reply("❌ Chave não encontrada."); break; }
-                kicked[t.toLowerCase()] = Date.now();
-                message.reply(`👢 \`${t}\` será kickado na próxima checagem.`);
-            }
+        case "info": {
+            const ks = Object.keys(keys);
+            if (!ks.length) { message.reply("Nenhuma chave ativa."); break; }
+            const embed = new EmbedBuilder().setTitle("🔑 Chaves Ativas").setColor(0x5865F2).setTimestamp();
+            embed.setDescription(ks.map(k => {
+                const d = keys[k]; const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
+                return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*"}`;
+            }).join("\n").substring(0, 4000));
+            message.reply({ embeds: [embed] });
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !cleanlogs  — limpa fila de brainrots
-        // ══════════════════════════════════════════════════════════════════
-        case "cleanlogs": {
-            const [pass] = args;
-            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
-            const count = brainrots.length;
-            brainrots.length = 0;
-            message.reply(`🧹 **${count}** brainrots removidos da fila.`);
+        case "lookup": {
+            const [name] = args; if (!name) { message.reply("Uso: `!lookup <nome>`"); break; }
+            const t = findKey(name); if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            const d = keys[t];
+            const embed = new EmbedBuilder().setTitle(`🔍 Info: ${t}`).setColor(d.paused ? 0xFFA000 : 0x00C853)
+                .addFields(
+                    { name: "⏱️ Tempo", value: d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now()), inline: true },
+                    { name: "📌 Status", value: d.paused ? "⏸️ Pausada" : "✅ Ativa", inline: true },
+                    { name: "💻 HWID",  value: d.hwid ? `\`${d.hwid.substring(0,12)}...\`` : "Livre", inline: false },
+                    { name: "👤 Discord", value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*", inline: true }
+                ).setTimestamp();
+            message.reply({ embeds: [embed] });
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !jobids  — mostra jobids recentes de usuários online
-        // ══════════════════════════════════════════════════════════════════
         case "jobids": {
             const entries = Object.entries(userJobIds);
             if (!entries.length) { message.reply("Nenhum JobID registrado."); break; }
-            const lines = entries.map(([name, jobId]) => `• **${name}**: \`${jobId}\``);
-            message.reply("🎮 **JobIDs conhecidos:**\n" + lines.join("\n"));
+            message.reply("🎮 **JobIDs:**\n" + entries.map(([n, j]) => `• **${n}**: \`${j}\``).join("\n"));
             break;
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // !help — lista de comandos
-        // ══════════════════════════════════════════════════════════════════
-        case "help": {
-            const embed = new EmbedBuilder()
-                .setTitle("📋 Comandos Bob Logs")
-                .setColor(0x5865F2)
-                .addFields(
-                    {
-                        name: "🔑 Gerenciar Keys",
-                        value:
-                            "`!create <h> <m> <nome> <senha>` — Cria chave\n" +
-                            "`!lifetime <nome> <senha>` — Cria chave lifetime\n" +
-                            "`!revoke <nome|all> <senha>` — Remove chave(s)\n" +
-                            "`!reset <nome|all> <senha>` — Reseta HWID\n" +
-                            "`!pause <nome|all> <senha>` — Pausa/retoma\n" +
-                            "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
-                            "`!addtime <nome|all> <h> <m> <senha>` — Adiciona tempo (suporta all)\n" +
-                            "`!setexpiry <nome> <h> <m> <senha>` — Redefine tempo\n" +
-                            "`!sethwid <nome> <hwid> <senha>` — Define HWID\n" +
-                            "`!transfer <old> <new> <senha>` — Renomeia key\n" +
-                            "`!kick <nome|all> <senha>` — Força desconexão",
-                        inline: false
-                    },
-                    {
-                        name: "📊 Informações",
-                        value:
-                            "`!info` — Lista todas as chaves\n" +
-                            "`!lookup <nome>` — Info detalhada de uma key\n" +
-                            "`!online` — Usuários online (tempo real, sem limite)\n" +
-                            "`!stoponline` — Para atualização do !online\n" +
-                            "`!stats` — Estatísticas gerais\n" +
-                            "`!jobids` — JobIDs dos usuários online\n" +
-                            "`!blocked` — IPs bloqueados",
-                        inline: false
-                    },
-                    {
-                        name: "🛠️ Administração",
-                        value:
-                            "`!unblock <ip> <senha>` — Desbloqueia IP\n" +
-                            "`!cleanlogs <senha>` — Limpa fila de brainrots\n" +
-                            "`!test` — Brainrot de teste",
-                        inline: false
-                    }
-                )
-                .setFooter({ text: "Suporte: all = afeta todas as keys" })
-                .setTimestamp();
-            message.reply({ embeds: [embed] });
+        case "cleanlogs": {
+            const [pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            const count = brainrots.length; brainrots.length = 0;
+            message.reply(`🧹 **${count}** brainrots removidos.`);
             break;
         }
     }
 });
 
-// ─── BOT PAINEL ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── BOT PAINEL (usuários) — sem alterações ───────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 const clientPanel = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -830,10 +1115,10 @@ function buildPanelEmbed() {
             "If you're a buyer, click on the buttons below to redeem your key, get the script or get your role"
         )
         .addFields(
-            { name: "🔑 Redeem Key", value: "Place to validate your Key", inline: false },
-            { name: "📋 View Script", value: "Shows the **Bob Joiner** Script (Key Required)", inline: false },
-            { name: "📊 Key Info", value: "Shows your Key Status (Key Required)", inline: false },
-            { name: "⚙️ Reset HWID", value: "Reset the Hardware Identification of your Key (Key Required)", inline: false }
+            { name: "🔑 Redeem Key",  value: "Place to validate your Key",                              inline: false },
+            { name: "📋 View Script", value: "Shows the **Bob Joiner** Script (Key Required)",          inline: false },
+            { name: "📊 Key Info",    value: "Shows your Key Status (Key Required)",                    inline: false },
+            { name: "⚙️ Reset HWID",  value: "Reset the Hardware Identification of your Key (Key Required)", inline: false }
         );
 }
 
@@ -986,52 +1271,32 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
     switch (interaction.customId) {
         case "panel_redeem": {
             awaitingInput[user.id] = { step: "redeem_key" };
-            try {
-                await user.send("🔑 **Redeem Key**\nEnvie sua key aqui para validar:");
-                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
-            } catch {
-                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
-            }
+            try { await user.send("🔑 **Redeem Key**\nEnvie sua key aqui para validar:"); await interaction.editReply({ content: "📩 Te mandei uma DM!" }); }
+            catch { await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" }); }
             break;
         }
         case "panel_script": {
             awaitingInput[user.id] = { step: "script_key" };
-            try {
-                await user.send("📋 **Get Script**\nEnvie sua key para receber o script:");
-                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
-            } catch {
-                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
-            }
+            try { await user.send("📋 **Get Script**\nEnvie sua key para receber o script:"); await interaction.editReply({ content: "📩 Te mandei uma DM!" }); }
+            catch { await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" }); }
             break;
         }
         case "panel_role": {
             awaitingInput[user.id] = { step: "role_key", guildId: interaction.guildId };
-            try {
-                await user.send("👤 **Get Role**\nEnvie sua key para vincular seu Discord e receber o cargo:");
-                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
-            } catch {
-                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
-            }
+            try { await user.send("👤 **Get Role**\nEnvie sua key para vincular seu Discord e receber o cargo:"); await interaction.editReply({ content: "📩 Te mandei uma DM!" }); }
+            catch { await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" }); }
             break;
         }
         case "panel_hwid": {
             awaitingInput[user.id] = { step: "hwid_key" };
-            try {
-                await user.send("⚙️ **Reset HWID**\nEnvie sua key:");
-                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
-            } catch {
-                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
-            }
+            try { await user.send("⚙️ **Reset HWID**\nEnvie sua key:"); await interaction.editReply({ content: "📩 Te mandei uma DM!" }); }
+            catch { await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" }); }
             break;
         }
         case "panel_stats": {
             awaitingInput[user.id] = { step: "stats_key" };
-            try {
-                await user.send("📊 **Key Info**\nEnvie sua key:");
-                await interaction.editReply({ content: "📩 Te mandei uma DM!" });
-            } catch {
-                await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" });
-            }
+            try { await user.send("📊 **Key Info**\nEnvie sua key:"); await interaction.editReply({ content: "📩 Te mandei uma DM!" }); }
+            catch { await interaction.editReply({ content: "❌ Habilite mensagens privadas do servidor!" }); }
             break;
         }
     }
@@ -1089,29 +1354,16 @@ app.post("/presence", requireClientHeader, async (req, res) => {
     const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query;
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
-
     presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: key || "" };
-
-    // Salva jobId automaticamente
     if (jobId && name) userJobIds[name] = jobId;
-
-    // ─── Vincula Discord ID automaticamente pela tela de login do script ──────
     if (discordId && r.keyName) {
         const d = keys[r.keyName];
-        const cleanId = String(discordId).replace(/\D/g, ""); // só números
-        if (cleanId.length >= 17 && cleanId.length <= 20) {   // Discord IDs têm 17-20 dígitos
-            if (!d.discordId) {
-                // Primeira vez — vincula direto
-                d.discordId = cleanId;
-                await saveKey(r.keyName);
-                console.log(`[PRESENCE] Discord ${cleanId} vinculado à key ${r.keyName} via login`);
-            } else if (d.discordId !== cleanId) {
-                // Já vinculado a outro — rejeita silenciosamente (não impede o script)
-                console.warn(`[PRESENCE] Key ${r.keyName} já vinculada ao Discord ${d.discordId}, ignorando ${cleanId}`);
-            }
+        const cleanId = String(discordId).replace(/\D/g, "");
+        if (cleanId.length >= 17 && cleanId.length <= 20) {
+            if (!d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); }
+            else if (d.discordId !== cleanId) console.warn(`[PRESENCE] Key ${r.keyName} já vinculada ao Discord ${d.discordId}`);
         }
     }
-
     res.json({ status: "ok" });
 });
 
@@ -1135,38 +1387,25 @@ app.get("/clients", (req, res) =>
 app.get("/test-emit", (req, res) => {
     if (req.query.secret !== SCRIPT_SECRET) return res.status(403).send("Secret invalido");
     const p = { id: Date.now().toString(), title: "TESTE MANUAL", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "0" };
-    brainrots.push(p);
-    io.emit("brainrot", p);
+    brainrots.push(p); io.emit("brainrot", p);
     res.send("✅ Emit enviado!");
 });
 
-// ─── /push-brainrot ───────────────────────────────────────────────────────────
 app.post("/push-brainrot", requireClientHeader, (req, res) => {
     const { secret, title, description, jobId, value, players } = req.body;
-
-    if (secret !== SCRIPT_SECRET)
-        return res.status(403).json({ status: "error", message: "Secret inválido" });
-
+    if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido" });
     const payload = {
-        id:          Date.now().toString(),
-        title:       title       || "Brainrot",
-        description: description || "",
-        brainrot:    title       || "Brainrot",
-        name:        title       || "Brainrot",
-        jobId:       xorObfuscate(jobId) || null,
-        value:       value       || "0",
-        players:     players     || "N/A"
+        id: Date.now().toString(), title: title || "Brainrot", description: description || "",
+        brainrot: title || "Brainrot", name: title || "Brainrot",
+        jobId: xorObfuscate(jobId) || null, value: value || "0", players: players || "N/A"
     };
-
     brainrots.push(payload);
     if (brainrots.length > 100) brainrots.shift();
     io.emit("brainrot", payload);
-
-    console.log(`[PUSH] ✅ ${payload.title} | jobId: ${payload.jobId} | Value: ${payload.value}`);
+    console.log(`[PUSH] ✅ ${payload.title}`);
     res.json({ status: "ok", id: payload.id });
 });
 
-// ─── /link-discord — vincula Discord ID via tela de login do Lua ─────────────
 app.post("/link-discord", requireClientHeader, async (req, res) => {
     const { key, secret, hwid, discordId } = req.query;
     const r = checkKey(key, secret, hwid);
@@ -1179,13 +1418,9 @@ app.post("/link-discord", requireClientHeader, async (req, res) => {
         return res.status(409).json({ status: "error", message: "Key ja vinculada a outro Discord ID." });
     d.discordId = cleanId;
     await saveKey(r.keyName);
-    console.log("[LINK] Discord " + cleanId + " vinculado a key " + r.keyName);
     res.json({ status: "ok", message: "Discord vinculado!" });
 });
 
-// ─── /report-jobid — o script Lua manda o jobId do usuário automaticamente ───
-// Chame assim no Lua:
-//   game:HttpPost(API_URL .. "/report-jobid?key=SUAKEY&secret=SECRET&name=" .. game.Players.LocalPlayer.Name .. "&jobId=" .. game.JobId, "", "application/json", {["x-bob-client"] = CLIENT_HEADER})
 app.post("/report-jobid", requireClientHeader, (req, res) => {
     const { key, secret, name, jobId } = req.query;
     if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido" });
