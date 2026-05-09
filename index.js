@@ -44,7 +44,14 @@ const KeyModel = mongoose.model("Key", KeySchema);
 async function loadKeys() {
     try {
         const docs = await KeyModel.find({});
+        let expired = 0;
         for (const d of docs) {
+            // Já remove expiradas ao carregar
+            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) {
+                await KeyModel.deleteOne({ name: d.name });
+                expired++;
+                continue;
+            }
             keys[d.name] = {
                 expiry:    d.expiry,
                 paused:    d.paused,
@@ -53,7 +60,7 @@ async function loadKeys() {
                 discordId: d.discordId
             };
         }
-        console.log(`[DB] ${docs.length} keys carregadas.`);
+        console.log(`[DB] ${Object.keys(keys).length} keys carregadas. ${expired} expiradas removidas.`);
     } catch (e) {
         console.error("[DB] Erro ao carregar keys:", e.message);
     }
@@ -79,6 +86,18 @@ async function deleteKey(name) {
     }
 }
 
+// ─── Limpa keys expiradas periodicamente ─────────────────────────────────────
+setInterval(async () => {
+    const now = Date.now();
+    for (const [name, data] of Object.entries(keys)) {
+        if (data.expiry !== Infinity && !data.paused && data.expiry - now <= 0) {
+            delete keys[name];
+            await deleteKey(name);
+            console.log(`[CLEANUP] Key expirada removida: ${name}`);
+        }
+    }
+}, 60000); // roda a cada 1 minuto
+
 // ─── EXPRESS + SOCKET.IO ──────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
@@ -101,7 +120,7 @@ const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
 const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL;
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
-const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "";
+const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "1502373185125875873"; // ← ATUALIZADO
 const LOGS_CHANNEL_ID        = process.env.LOGS_CHANNEL_ID    || "";
 const SCRIPT_URL             = process.env.SCRIPT_URL         || "";
 
@@ -110,6 +129,9 @@ const keys      = {};
 const brainrots = [];
 const presence  = {};
 const kicked    = {};
+
+// ─── Mapa de jobIds por usuário Roblox (name → jobId) ─────────────────────────
+const userJobIds = {};
 
 // ─── RATE LIMITER ─────────────────────────────────────────────────────────────
 const RATE_LIMIT_MAX    = 60;
@@ -216,6 +238,9 @@ const checkKey = (key, secret, hwid) => {
 };
 
 // ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
+// ℹ️ O Bob Notifier ainda é necessário se você usa um canal do Discord para
+//    receber alertas de brainrots via embed. Se os brainrots chegam SOMENTE
+//    via POST /push-brainrot, pode remover o token DISCORD_TOKEN_NOTIFIER.
 const clientNotifier = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -277,8 +302,14 @@ clientLogs.on("messageCreate", async (message) => {
     const args = message.content.slice(1).trim().split(/ +/);
     const cmd  = args.shift().toLowerCase();
 
+    // ── Helper: verifica senha ──────────────────────────────────────────────
+    const wrongPass = (pass) => pass !== ADMIN_PASS;
+
     switch (cmd) {
 
+        // ══════════════════════════════════════════════════════════════════
+        // !online — atualiza sem limite de tempo (para com !stoponline)
+        // ══════════════════════════════════════════════════════════════════
         case "online": {
             const buildOnlineEmbed = () => {
                 const now = Date.now();
@@ -298,43 +329,62 @@ clientLogs.on("messageCreate", async (message) => {
                         else { timeLeft = keyData.expiry === Infinity ? "Lifetime ♾️" : formatTime(keyData.expiry - now); }
                     }
                     const discordId = keyData?.discordId || null;
-                    userMap[robloxName] = { timeLeft, status, discordId };
+                    const jobId = userJobIds[robloxName] || null;
+                    userMap[robloxName] = { timeLeft, status, discordId, jobId };
                 }
                 const userList = Object.entries(userMap);
                 const embed = new EmbedBuilder()
                     .setTitle("🟢 Usuários Online no Script")
                     .setColor(0x00C853)
-                    .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s` })
+                    .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s • Digite !stoponline para parar` })
                     .setTimestamp();
                 if (userList.length === 0) {
                     embed.setDescription("Nenhum usuário online no momento.");
                 } else {
                     const lines = userList.map(([robloxName, data]) => {
-                        const mention = data.discordId ? `<@${data.discordId}>` : "*(sem Discord)*";
-                        return `${data.status} **${robloxName}** — ${mention} — ⏱️ \`${data.timeLeft}\``;
+                        const mention  = data.discordId ? `<@${data.discordId}>` : "*(sem Discord)*";
+                        const jobPart  = data.jobId ? ` | 🎮 \`${data.jobId.substring(0,8)}...\`` : "";
+                        return `${data.status} **${robloxName}** — ${mention} — ⏱️ \`${data.timeLeft}\`${jobPart}`;
                     });
                     embed.setDescription(lines.join("\n"));
                 }
                 return embed;
             };
+
             const sentMsg = await message.reply({ embeds: [buildOnlineEmbed()] });
-            let edits = 0;
-            const MAX_EDITS = 60;
-            const interval = setInterval(async () => {
-                edits++;
-                if (edits >= MAX_EDITS) {
-                    clearInterval(interval);
-                    const finalEmbed = buildOnlineEmbed()
-                        .setFooter({ text: "Bob Joiner • Atualização encerrada após 5 minutos" })
-                        .setColor(0x555555);
-                    await sentMsg.edit({ embeds: [finalEmbed] }).catch(() => {});
-                    return;
-                }
-                await sentMsg.edit({ embeds: [buildOnlineEmbed()] }).catch(() => clearInterval(interval));
+
+            // Guarda o interval no mapa para poder parar depois
+            if (!global.onlineIntervals) global.onlineIntervals = {};
+            if (global.onlineIntervals[message.channel.id]) {
+                clearInterval(global.onlineIntervals[message.channel.id]);
+            }
+
+            global.onlineIntervals[message.channel.id] = setInterval(async () => {
+                await sentMsg.edit({ embeds: [buildOnlineEmbed()] }).catch(() => {
+                    clearInterval(global.onlineIntervals[message.channel.id]);
+                    delete global.onlineIntervals[message.channel.id];
+                });
             }, 5000);
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !stoponline — para atualização do !online neste canal
+        // ══════════════════════════════════════════════════════════════════
+        case "stoponline": {
+            if (global.onlineIntervals && global.onlineIntervals[message.channel.id]) {
+                clearInterval(global.onlineIntervals[message.channel.id]);
+                delete global.onlineIntervals[message.channel.id];
+                message.reply("⏹️ Atualização do !online parada.");
+            } else {
+                message.reply("Nenhuma atualização ativa neste canal.");
+            }
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !blocked — lista IPs bloqueados
+        // ══════════════════════════════════════════════════════════════════
         case "blocked": {
             const now = Date.now();
             const active = Object.entries(blockedIPs).filter(([, until]) => now < until);
@@ -344,14 +394,20 @@ clientLogs.on("messageCreate", async (message) => {
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !unblock <ip> <senha>
+        // ══════════════════════════════════════════════════════════════════
         case "unblock": {
             const [ip, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
             if (blockedIPs[ip]) { delete blockedIPs[ip]; message.reply(`✅ IP \`${ip}\` desbloqueado.`); }
             else message.reply("IP não estava bloqueado.");
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !test — brainrot de teste
+        // ══════════════════════════════════════════════════════════════════
         case "test": {
             const payload = {
                 id: Date.now().toString(), title: "TESTE", description: "SINAL OK!",
@@ -363,86 +419,149 @@ clientLogs.on("messageCreate", async (message) => {
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !info — lista todas as keys
+        // ══════════════════════════════════════════════════════════════════
         case "info": {
             const ks = Object.keys(keys);
             if (!ks.length) { message.reply("Nenhuma chave ativa."); break; }
-            let info = "**Chaves Ativas:**\n";
-            for (const k of ks) {
+            const embed = new EmbedBuilder()
+                .setTitle("🔑 Chaves Ativas")
+                .setColor(0x5865F2)
+                .setTimestamp();
+            const lines = ks.map(k => {
                 const d = keys[k];
                 const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
                 const discord = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
-                info += `• \`${k}\`: ${formatTime(t)} ${d.paused ? "⏸️" : "✅"} ${discord} ${d.hwid ? `(HWID: ${d.hwid.substring(0,6)}...)` : "(Livre)"}\n`;
-            }
-            message.reply(info);
+                const hwid    = d.hwid ? `HWID: ${d.hwid.substring(0,6)}...` : "Livre";
+                return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${discord} *(${hwid})*`;
+            });
+            embed.setDescription(lines.join("\n"));
+            message.reply({ embeds: [embed] });
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !create <h> <m> <nome> <senha>
+        // ══════════════════════════════════════════════════════════════════
         case "create": {
             if (args.length < 4) { message.reply("Uso: `!create <h> <m> <nome> <senha>`"); break; }
             const [h, m, name, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            if (findKey(name)) { message.reply(`❌ Chave \`${name}\` já existe!`); break; }
             const dur = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
+            if (dur <= 0) { message.reply("❌ Duração inválida!"); break; }
             keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
             await saveKey(name);
-            message.reply(`✅ Chave \`${name}\` criada! Duração: ${formatTime(dur)}`);
+            message.reply(`✅ Chave \`${name}\` criada! Duração: **${formatTime(dur)}**`);
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !lifetime <nome> <senha>
+        // ══════════════════════════════════════════════════════════════════
         case "lifetime": {
             const [name, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
             keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
             await saveKey(name);
-            message.reply(`✅ Chave \`${name}\` criada como **Lifetime**!`);
+            message.reply(`✅ Chave \`${name}\` criada como **Lifetime ♾️**!`);
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !reset <nome|all> <senha>  — reseta HWID
+        // ══════════════════════════════════════════════════════════════════
         case "reset": {
             const [name, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            keys[t].hwid = null;
-            kicked[t.toLowerCase()] = Date.now();
-            await saveKey(t);
-            message.reply(`✅ HWID de \`${t}\` resetado!`);
-            break;
-        }
-
-        case "pause": {
-            const [name, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            const d = keys[t];
-            if (d.paused) {
-                d.expiry = Date.now() + d.remaining; d.paused = false;
-                await saveKey(t);
-                message.reply(`▶️ \`${t}\` retomada! Tempo: ${formatTime(d.remaining)}`);
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            if (name.toLowerCase() === "all") {
+                let count = 0;
+                for (const k of Object.keys(keys)) {
+                    keys[k].hwid = null;
+                    kicked[k.toLowerCase()] = Date.now();
+                    await saveKey(k);
+                    count++;
+                }
+                message.reply(`✅ HWID de **${count} chaves** resetado!`);
             } else {
-                d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
-                d.paused = true;
+                const t = findKey(name);
+                if (!t) { message.reply("❌ Chave não encontrada."); break; }
+                keys[t].hwid = null;
+                kicked[t.toLowerCase()] = Date.now();
                 await saveKey(t);
-                message.reply(`⏸️ \`${t}\` pausada!`);
+                message.reply(`✅ HWID de \`${t}\` resetado!`);
             }
             break;
         }
 
-        case "revoke": {
+        // ══════════════════════════════════════════════════════════════════
+        // !pause <nome|all> <senha>  — pausa/retoma
+        // ══════════════════════════════════════════════════════════════════
+        case "pause": {
             const [name, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
-            const t = findKey(name);
-            if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            delete keys[t];
-            await deleteKey(t);
-            message.reply(`🗑️ \`${t}\` removida.`);
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            if (name.toLowerCase() === "all") {
+                let paused = 0, resumed = 0;
+                for (const k of Object.keys(keys)) {
+                    const d = keys[k];
+                    if (d.paused) {
+                        d.expiry = Date.now() + d.remaining; d.paused = false; resumed++;
+                    } else {
+                        d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
+                        d.paused = true; paused++;
+                    }
+                    await saveKey(k);
+                }
+                message.reply(`⏸️ **${paused}** chaves pausadas, **${resumed}** retomadas.`);
+            } else {
+                const t = findKey(name);
+                if (!t) { message.reply("❌ Chave não encontrada."); break; }
+                const d = keys[t];
+                if (d.paused) {
+                    d.expiry = Date.now() + d.remaining; d.paused = false;
+                    await saveKey(t);
+                    message.reply(`▶️ \`${t}\` retomada! Tempo restante: **${formatTime(d.remaining)}**`);
+                } else {
+                    d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now();
+                    d.paused = true;
+                    await saveKey(t);
+                    message.reply(`⏸️ \`${t}\` pausada! Tempo salvo: **${formatTime(d.remaining)}**`);
+                }
+            }
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !revoke <nome|all> <senha>
+        // ══════════════════════════════════════════════════════════════════
+        case "revoke": {
+            const [name, pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            if (name.toLowerCase() === "all") {
+                const count = Object.keys(keys).length;
+                for (const k of Object.keys(keys)) {
+                    delete keys[k];
+                    await deleteKey(k);
+                }
+                message.reply(`🗑️ **${count} chaves** removidas.`);
+            } else {
+                const t = findKey(name);
+                if (!t) { message.reply("❌ Chave não encontrada."); break; }
+                delete keys[t];
+                await deleteKey(t);
+                message.reply(`🗑️ Chave \`${t}\` removida.`);
+            }
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !extend <nome> <h> <m> <senha>
+        // ══════════════════════════════════════════════════════════════════
         case "extend": {
             if (args.length < 4) { message.reply("Uso: `!extend <nome> <h> <m> <senha>`"); break; }
             const [name, h, m, pass] = args;
-            if (pass !== ADMIN_PASS) { message.reply("❌ Senha incorreta!"); break; }
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
             const t = findKey(name);
             if (!t) { message.reply("❌ Chave não encontrada."); break; }
             const extra = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
@@ -450,25 +569,240 @@ clientLogs.on("messageCreate", async (message) => {
             if (d.paused) d.remaining += extra;
             else if (d.expiry !== Infinity) d.expiry += extra;
             await saveKey(t);
-            message.reply(`✅ \`${t}\` estendida em ${formatTime(extra)}!`);
+            message.reply(`✅ \`${t}\` estendida em **${formatTime(extra)}**!`);
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // !addtime <nome|all> <h> <m> <senha>  — igual ao extend mas suporta "all"
+        // ══════════════════════════════════════════════════════════════════
+        case "addtime": {
+            if (args.length < 4) { message.reply("Uso: `!addtime <nome|all> <h> <m> <senha>`"); break; }
+            const [name, h, m, pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            const extra = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
+            if (extra <= 0) { message.reply("❌ Tempo inválido!"); break; }
+            if (name.toLowerCase() === "all") {
+                let count = 0;
+                for (const k of Object.keys(keys)) {
+                    const d = keys[k];
+                    if (d.paused) d.remaining += extra;
+                    else if (d.expiry !== Infinity) d.expiry += extra;
+                    await saveKey(k);
+                    count++;
+                }
+                message.reply(`✅ **${formatTime(extra)}** adicionado a **${count} chaves**!`);
+            } else {
+                const t = findKey(name);
+                if (!t) { message.reply("❌ Chave não encontrada."); break; }
+                const d = keys[t];
+                if (d.paused) d.remaining += extra;
+                else if (d.expiry !== Infinity) d.expiry += extra;
+                await saveKey(t);
+                message.reply(`✅ **${formatTime(extra)}** adicionado a \`${t}\`!`);
+            }
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !setexpiry <nome> <h> <m> <senha>  — redefine o tempo da key
+        // ══════════════════════════════════════════════════════════════════
+        case "setexpiry": {
+            if (args.length < 4) { message.reply("Uso: `!setexpiry <nome> <h> <m> <senha>`"); break; }
+            const [name, h, m, pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            const dur = (parseInt(h) * 3600 + parseInt(m) * 60) * 1000;
+            if (dur <= 0) { message.reply("❌ Duração inválida!"); break; }
+            const d = keys[t];
+            if (d.paused) { d.remaining = dur; }
+            else { d.expiry = Date.now() + dur; d.remaining = dur; }
+            await saveKey(t);
+            message.reply(`✅ Expiração de \`${t}\` redefinida para **${formatTime(dur)}**!`);
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !sethwid <nome> <hwid> <senha>  — força um HWID manualmente
+        // ══════════════════════════════════════════════════════════════════
+        case "sethwid": {
+            if (args.length < 3) { message.reply("Uso: `!sethwid <nome> <hwid> <senha>`"); break; }
+            const [name, hwid, pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            keys[t].hwid = hwid;
+            await saveKey(t);
+            message.reply(`✅ HWID de \`${t}\` definido para \`${hwid}\`!`);
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !transfer <nomeAntigo> <nomeNovo> <senha>  — renomeia uma key
+        // ══════════════════════════════════════════════════════════════════
+        case "transfer": {
+            if (args.length < 3) { message.reply("Uso: `!transfer <nomeAntigo> <nomeNovo> <senha>`"); break; }
+            const [oldName, newName, pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            const t = findKey(oldName);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            if (findKey(newName)) { message.reply(`❌ Chave \`${newName}\` já existe!`); break; }
+            keys[newName] = { ...keys[t] };
+            delete keys[t];
+            await deleteKey(t);
+            await saveKey(newName);
+            message.reply(`✅ Chave transferida de \`${t}\` para \`${newName}\`!`);
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !lookup <nome>  — info detalhada de uma key (sem precisar de senha)
+        // ══════════════════════════════════════════════════════════════════
+        case "lookup": {
+            const [name] = args;
+            if (!name) { message.reply("Uso: `!lookup <nome>`"); break; }
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            const d = keys[t];
+            const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
+            const status   = d.paused ? "⏸️ Pausada" : "✅ Ativa";
+            const hwid     = d.hwid ? `\`${d.hwid.substring(0,12)}...\`` : "Nenhum (Livre)";
+            const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
+            const jobId    = d.discordId ? (userJobIds[d.discordId] || "Nenhum") : "Nenhum";
+            const embed = new EmbedBuilder()
+                .setTitle(`🔍 Info: ${t}`)
+                .setColor(d.paused ? 0xFFA000 : 0x00C853)
+                .addFields(
+                    { name: "⏱️ Tempo Restante", value: timeLeft,  inline: true  },
+                    { name: "📌 Status",          value: status,    inline: true  },
+                    { name: "💻 HWID",            value: hwid,      inline: false },
+                    { name: "👤 Discord",          value: discord,   inline: true  },
+                    { name: "🎮 JobID",            value: String(jobId), inline: true }
+                )
+                .setTimestamp();
+            message.reply({ embeds: [embed] });
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !stats  — estatísticas gerais
+        // ══════════════════════════════════════════════════════════════════
+        case "stats": {
+            const all    = Object.values(keys);
+            const active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0));
+            const paused = all.filter(k => k.paused);
+            const lt     = all.filter(k => k.expiry === Infinity);
+            const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
+            const embed = new EmbedBuilder()
+                .setTitle("📊 Estatísticas Bob Joiner")
+                .setColor(0x5865F2)
+                .addFields(
+                    { name: "🔑 Total de Keys",   value: String(all.length),    inline: true },
+                    { name: "✅ Ativas",           value: String(active.length), inline: true },
+                    { name: "⏸️ Pausadas",         value: String(paused.length), inline: true },
+                    { name: "♾️ Lifetime",         value: String(lt.length),     inline: true },
+                    { name: "🟢 Online agora",     value: String(online.length), inline: true },
+                    { name: "📡 Brainrots (fila)", value: String(brainrots.length), inline: true }
+                )
+                .setTimestamp();
+            message.reply({ embeds: [embed] });
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !kick <nome|all> <senha>  — força desconexão (via HWID reset + kicked flag)
+        // ══════════════════════════════════════════════════════════════════
+        case "kick": {
+            const [name, pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            if (name.toLowerCase() === "all") {
+                let count = 0;
+                for (const k of Object.keys(keys)) {
+                    kicked[k.toLowerCase()] = Date.now();
+                    count++;
+                }
+                message.reply(`👢 **${count} usuários** marcados para kick!`);
+            } else {
+                const t = findKey(name);
+                if (!t) { message.reply("❌ Chave não encontrada."); break; }
+                kicked[t.toLowerCase()] = Date.now();
+                message.reply(`👢 \`${t}\` será kickado na próxima checagem.`);
+            }
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !cleanlogs  — limpa fila de brainrots
+        // ══════════════════════════════════════════════════════════════════
+        case "cleanlogs": {
+            const [pass] = args;
+            if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; }
+            const count = brainrots.length;
+            brainrots.length = 0;
+            message.reply(`🧹 **${count}** brainrots removidos da fila.`);
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !jobids  — mostra jobids recentes de usuários online
+        // ══════════════════════════════════════════════════════════════════
+        case "jobids": {
+            const entries = Object.entries(userJobIds);
+            if (!entries.length) { message.reply("Nenhum JobID registrado."); break; }
+            const lines = entries.map(([name, jobId]) => `• **${name}**: \`${jobId}\``);
+            message.reply("🎮 **JobIDs conhecidos:**\n" + lines.join("\n"));
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // !help — lista de comandos
+        // ══════════════════════════════════════════════════════════════════
         case "help": {
-            message.reply(
-                "**📋 Comandos:**\n" +
-                "`!create <h> <m> <nome> <senha>` — Cria chave\n" +
-                "`!lifetime <nome> <senha>` — Cria chave lifetime\n" +
-                "`!revoke <nome> <senha>` — Remove chave\n" +
-                "`!reset <nome> <senha>` — Reseta HWID\n" +
-                "`!pause <nome> <senha>` — Pausa/retoma\n" +
-                "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
-                "`!info` — Lista chaves\n" +
-                "`!online` — Usuários online (tempo real)\n" +
-                "`!blocked` — IPs bloqueados\n" +
-                "`!unblock <ip> <senha>` — Desbloqueia IP\n" +
-                "`!test` — Brainrot de teste"
-            );
+            const embed = new EmbedBuilder()
+                .setTitle("📋 Comandos Bob Logs")
+                .setColor(0x5865F2)
+                .addFields(
+                    {
+                        name: "🔑 Gerenciar Keys",
+                        value:
+                            "`!create <h> <m> <nome> <senha>` — Cria chave\n" +
+                            "`!lifetime <nome> <senha>` — Cria chave lifetime\n" +
+                            "`!revoke <nome|all> <senha>` — Remove chave(s)\n" +
+                            "`!reset <nome|all> <senha>` — Reseta HWID\n" +
+                            "`!pause <nome|all> <senha>` — Pausa/retoma\n" +
+                            "`!extend <nome> <h> <m> <senha>` — Adiciona tempo\n" +
+                            "`!addtime <nome|all> <h> <m> <senha>` — Adiciona tempo (suporta all)\n" +
+                            "`!setexpiry <nome> <h> <m> <senha>` — Redefine tempo\n" +
+                            "`!sethwid <nome> <hwid> <senha>` — Define HWID\n" +
+                            "`!transfer <old> <new> <senha>` — Renomeia key\n" +
+                            "`!kick <nome|all> <senha>` — Força desconexão",
+                        inline: false
+                    },
+                    {
+                        name: "📊 Informações",
+                        value:
+                            "`!info` — Lista todas as chaves\n" +
+                            "`!lookup <nome>` — Info detalhada de uma key\n" +
+                            "`!online` — Usuários online (tempo real, sem limite)\n" +
+                            "`!stoponline` — Para atualização do !online\n" +
+                            "`!stats` — Estatísticas gerais\n" +
+                            "`!jobids` — JobIDs dos usuários online\n" +
+                            "`!blocked` — IPs bloqueados",
+                        inline: false
+                    },
+                    {
+                        name: "🛠️ Administração",
+                        value:
+                            "`!unblock <ip> <senha>` — Desbloqueia IP\n" +
+                            "`!cleanlogs <senha>` — Limpa fila de brainrots\n" +
+                            "`!test` — Brainrot de teste",
+                        inline: false
+                    }
+                )
+                .setFooter({ text: "Suporte: all = afeta todas as keys" })
+                .setTimestamp();
+            message.reply({ embeds: [embed] });
             break;
         }
     }
@@ -706,7 +1040,7 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
 // ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: Date.now() }));
-app.get("/",       (req, res) => res.send("<h1>Bob API v9 — Online ✅</h1>"));
+app.get("/",       (req, res) => res.send("<h1>Bob API v10 — Online ✅</h1>"));
 
 app.get("/validate", requireClientHeader, (req, res) => {
     const { key, secret, hwid } = req.query;
@@ -751,11 +1085,33 @@ app.get("/kicked", requireClientHeader, (req, res) => {
     res.json({ kicked: false });
 });
 
-app.post("/presence", requireClientHeader, (req, res) => {
-    const { key, secret, hwid, sessionId, name } = req.query;
+app.post("/presence", requireClientHeader, async (req, res) => {
+    const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query;
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+
     presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: key || "" };
+
+    // Salva jobId automaticamente
+    if (jobId && name) userJobIds[name] = jobId;
+
+    // ─── Vincula Discord ID automaticamente pela tela de login do script ──────
+    if (discordId && r.keyName) {
+        const d = keys[r.keyName];
+        const cleanId = String(discordId).replace(/\D/g, ""); // só números
+        if (cleanId.length >= 17 && cleanId.length <= 20) {   // Discord IDs têm 17-20 dígitos
+            if (!d.discordId) {
+                // Primeira vez — vincula direto
+                d.discordId = cleanId;
+                await saveKey(r.keyName);
+                console.log(`[PRESENCE] Discord ${cleanId} vinculado à key ${r.keyName} via login`);
+            } else if (d.discordId !== cleanId) {
+                // Já vinculado a outro — rejeita silenciosamente (não impede o script)
+                console.warn(`[PRESENCE] Key ${r.keyName} já vinculada ao Discord ${d.discordId}, ignorando ${cleanId}`);
+            }
+        }
+    }
+
     res.json({ status: "ok" });
 });
 
@@ -784,7 +1140,7 @@ app.get("/test-emit", (req, res) => {
     res.send("✅ Emit enviado!");
 });
 
-// ─── /push-brainrot — recebe do script hop direto ─────────────────────────────
+// ─── /push-brainrot ───────────────────────────────────────────────────────────
 app.post("/push-brainrot", requireClientHeader, (req, res) => {
     const { secret, title, description, jobId, value, players } = req.body;
 
@@ -810,12 +1166,41 @@ app.post("/push-brainrot", requireClientHeader, (req, res) => {
     res.json({ status: "ok", id: payload.id });
 });
 
+// ─── /link-discord — vincula Discord ID via tela de login do Lua ─────────────
+app.post("/link-discord", requireClientHeader, async (req, res) => {
+    const { key, secret, hwid, discordId } = req.query;
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    const cleanId = String(discordId || "").replace(/\D/g, "");
+    if (cleanId.length < 17 || cleanId.length > 20)
+        return res.status(400).json({ status: "error", message: "Discord ID invalido." });
+    const d = keys[r.keyName];
+    if (d.discordId && d.discordId !== cleanId)
+        return res.status(409).json({ status: "error", message: "Key ja vinculada a outro Discord ID." });
+    d.discordId = cleanId;
+    await saveKey(r.keyName);
+    console.log("[LINK] Discord " + cleanId + " vinculado a key " + r.keyName);
+    res.json({ status: "ok", message: "Discord vinculado!" });
+});
+
+// ─── /report-jobid — o script Lua manda o jobId do usuário automaticamente ───
+// Chame assim no Lua:
+//   game:HttpPost(API_URL .. "/report-jobid?key=SUAKEY&secret=SECRET&name=" .. game.Players.LocalPlayer.Name .. "&jobId=" .. game.JobId, "", "application/json", {["x-bob-client"] = CLIENT_HEADER})
+app.post("/report-jobid", requireClientHeader, (req, res) => {
+    const { key, secret, name, jobId } = req.query;
+    if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido" });
+    const keyName = findKey(key);
+    if (!keyName) return res.status(403).json({ status: "error", message: "Key inválida" });
+    if (name && jobId) userJobIds[name] = jobId;
+    res.json({ status: "ok" });
+});
+
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 if (DISCORD_TOKEN_NOTIFIER) {
     clientNotifier.login(DISCORD_TOKEN_NOTIFIER)
         .then(() => console.log("[NOTIFIER] Login OK"))
         .catch(e => console.error("[NOTIFIER] Erro login:", e.message));
-} else console.warn("[NOTIFIER] Token ausente.");
+} else console.warn("[NOTIFIER] Token ausente — Bob Notifier desativado.");
 
 if (DISCORD_TOKEN_LOGS) {
     clientLogs.login(DISCORD_TOKEN_LOGS)
