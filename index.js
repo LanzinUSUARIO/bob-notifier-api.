@@ -23,6 +23,9 @@ function xorObfuscate(value) {
     return Buffer.from(result, "binary").toString("base64");
 }
 
+// ─── CONSTANTE PARA LIFETIME (Infinity não persiste no MongoDB) ───────────────
+const LIFETIME_VALUE = 9999999999999;
+
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
 const MONGODB_URI = process.env.MONGODB_URI;
 if (MONGODB_URI) {
@@ -35,7 +38,7 @@ if (MONGODB_URI) {
 
 const KeySchema = new mongoose.Schema({
     name:      { type: String, required: true, unique: true },
-    expiry:    { type: Number, default: Infinity },
+    expiry:    { type: Number, default: LIFETIME_VALUE },
     paused:    { type: Boolean, default: false },
     remaining: { type: Number, default: 0 },
     hwid:      { type: String, default: null },
@@ -48,17 +51,21 @@ async function loadKeys() {
         const docs = await KeyModel.find({});
         let expired = 0;
         for (const d of docs) {
-            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) {
+            // FIX: Converte LIFETIME_VALUE de volta para Infinity
+            const expiry    = d.expiry    >= LIFETIME_VALUE ? Infinity : d.expiry;
+            const remaining = d.remaining >= LIFETIME_VALUE ? Infinity : d.remaining;
+
+            if (expiry !== Infinity && expiry - Date.now() <= 0) {
                 await KeyModel.deleteOne({ name: d.name });
                 expired++;
                 continue;
             }
             keys[d.name] = {
-                expiry:    d.expiry,
+                expiry,
                 paused:    d.paused,
-                remaining: d.remaining,
-                hwid:      d.hwid,
-                discordId: d.discordId
+                remaining,
+                hwid:      d.hwid      || null,
+                discordId: d.discordId || null
             };
         }
         console.log(`[DB] ${Object.keys(keys).length} keys carregadas. ${expired} expiradas removidas.`);
@@ -69,9 +76,13 @@ async function loadKeys() {
 
 async function saveKey(name) {
     try {
+        // FIX: Converte Infinity para LIFETIME_VALUE antes de salvar no MongoDB
+        const raw = { ...keys[name] };
+        if (raw.expiry    === Infinity) raw.expiry    = LIFETIME_VALUE;
+        if (raw.remaining === Infinity) raw.remaining = LIFETIME_VALUE;
         await KeyModel.findOneAndUpdate(
             { name },
-            { name, ...keys[name] },
+            { name, ...raw },
             { upsert: true, new: true }
         );
     } catch (e) {
@@ -113,9 +124,9 @@ const io = new Server(server, {
 const port = process.env.PORT || 3000;
 
 // ─── ENV VARS ─────────────────────────────────────────────────────────────────
-const ADMIN_PASS         = process.env.ADMIN_PASS    || "ADMIN_PADRAO_MUDE_NO_RENDER";
-const SCRIPT_SECRET      = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
-const CLIENT_HEADER      = process.env.CLIENT_HEADER || "BobJoiner-v2";
+const ADMIN_PASS             = process.env.ADMIN_PASS    || "ADMIN_PADRAO_MUDE_NO_RENDER";
+const SCRIPT_SECRET          = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
+const CLIENT_HEADER          = process.env.CLIENT_HEADER || "BobJoiner-v2";
 
 const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
@@ -123,15 +134,14 @@ const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL;
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
 const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "1502373185125875873";
 const LOGS_CHANNEL_ID        = process.env.LOGS_CHANNEL_ID    || "";
-// ID do canal onde o painel do Bob Logs será enviado
 const BOB_LOGS_PANEL_CHANNEL = process.env.BOB_LOGS_PANEL_CHANNEL || "";
 const SCRIPT_URL             = process.env.SCRIPT_URL         || "";
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-const keys      = {};
-const brainrots = [];
-const presence  = {};
-const kicked    = {};
+const keys       = {};
+const brainrots  = [];
+const presence   = {};
+const kicked     = {};
 const userJobIds = {};
 
 // ─── RATE LIMITER ─────────────────────────────────────────────────────────────
@@ -213,13 +223,22 @@ const formatTime = (ms) => {
     return p.join(" ");
 };
 
+// FIX 1: findKey com .trim() — evita espaços invisíveis quebrando a busca
 const findKey = (name) =>
-    Object.keys(keys).find(k => k.toLowerCase() === (name || "").toLowerCase());
+    Object.keys(keys).find(k => k.toLowerCase() === (name || "").trim().toLowerCase());
 
+// FIX 2 + 3: checkKey com trim na key/hwid e trata hwid vazio como null
 const checkKey = (key, secret, hwid) => {
     if (secret !== SCRIPT_SECRET) return { ok: false, error: "Secret invalido" };
-    const keyName = findKey(key);
-    const data = keys[keyName];
+
+    const keyClean  = (key  || "").trim();
+    const hwidClean = (hwid || "").trim() || null;
+
+    console.log(`[CHECKKEY] key="${keyClean}" hwid="${hwidClean}" keys_mem=${Object.keys(keys).length}`);
+
+    const keyName = findKey(keyClean);
+    const data    = keys[keyName];
+
     if (!data)       return { ok: false, error: "Chave nao existe" };
     if (data.paused) return { ok: false, error: "Chave pausada" };
     if (data.expiry !== Infinity && data.expiry - Date.now() <= 0) {
@@ -227,8 +246,19 @@ const checkKey = (key, secret, hwid) => {
         deleteKey(keyName);
         return { ok: false, error: "Chave expirada" };
     }
-    if (!data.hwid) { data.hwid = hwid; saveKey(keyName); }
-    else if (data.hwid !== hwid) return { ok: false, error: "HWID invalido" };
+
+    // FIX: Só valida HWID se o script mandou um hwid não-vazio
+    if (hwidClean) {
+        if (!data.hwid) {
+            data.hwid = hwidClean;
+            saveKey(keyName);
+            console.log(`[CHECKKEY] HWID registrado para "${keyName}": ${hwidClean}`);
+        } else if (data.hwid !== hwidClean) {
+            console.warn(`[CHECKKEY] HWID inválido para "${keyName}". Esperado: ${data.hwid} | Recebido: ${hwidClean}`);
+            return { ok: false, error: "HWID invalido" };
+        }
+    }
+
     return { ok: true, data, keyName };
 };
 
@@ -267,7 +297,7 @@ clientNotifier.on("messageCreate", async (message) => {
         description: embed.description || "Novo Alerta!",
         brainrot:    embed.title       || "Brainrot",
         name:        embed.title       || "Brainrot",
-        jobId: xorObfuscate(jobId), value, players
+        jobId:       xorObfuscate(jobId), value, players
     };
 
     brainrots.push(payload);
@@ -292,7 +322,6 @@ clientLogs.on("ready", async () => {
     await sendLogsPanel();
 });
 
-// ── Constrói o embed do painel de administração ───────────────────────────────
 function buildLogsEmbed() {
     return new EmbedBuilder()
         .setTitle("🛠️ Bob Logs — Painel de Administração")
@@ -311,9 +340,7 @@ function buildLogsEmbed() {
         .setTimestamp();
 }
 
-// ── Linhas de botões do painel de logs ───────────────────────────────────────
 function buildLogsRows() {
-    // Linha 1 — Keys
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("logs_create").setLabel("Criar Key").setEmoji("🔑").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("logs_lifetime").setLabel("Lifetime").setEmoji("♾️").setStyle(ButtonStyle.Success),
@@ -321,7 +348,6 @@ function buildLogsRows() {
         new ButtonBuilder().setCustomId("logs_pause").setLabel("Pausar").setEmoji("⏸️").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("logs_reset").setLabel("Reset HWID").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
     );
-    // Linha 2 — Tempo
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("logs_addtime").setLabel("Add Tempo").setEmoji("⏱️").setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("logs_setexpiry").setLabel("Set Expiração").setEmoji("📅").setStyle(ButtonStyle.Primary),
@@ -329,7 +355,6 @@ function buildLogsRows() {
         new ButtonBuilder().setCustomId("logs_transfer").setLabel("Transfer Key").setEmoji("🔀").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("logs_sethwid").setLabel("Set HWID").setEmoji("💻").setStyle(ButtonStyle.Secondary),
     );
-    // Linha 3 — Info
     const row3 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("logs_online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("logs_stoponline").setLabel("Stop Online").setEmoji("⏹️").setStyle(ButtonStyle.Danger),
@@ -337,7 +362,6 @@ function buildLogsRows() {
         new ButtonBuilder().setCustomId("logs_info").setLabel("Listar Keys").setEmoji("📋").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("logs_lookup").setLabel("Lookup").setEmoji("🔍").setStyle(ButtonStyle.Secondary),
     );
-    // Linha 4 — Segurança / Utilitários
     const row4 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("logs_jobids").setLabel("JobIDs").setEmoji("🎮").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("logs_blocked").setLabel("IPs Bloqueados").setEmoji("🔒").setStyle(ButtonStyle.Secondary),
@@ -345,11 +369,9 @@ function buildLogsRows() {
         new ButtonBuilder().setCustomId("logs_cleanlogs").setLabel("Limpar Logs").setEmoji("🧹").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId("logs_test").setLabel("Teste").setEmoji("🧪").setStyle(ButtonStyle.Secondary),
     );
-
     return [row1, row2, row3, row4];
 }
 
-// ── Envia (ou reenvia) o painel no canal BOB_LOGS_PANEL_CHANNEL ───────────────
 async function sendLogsPanel() {
     const channelId = BOB_LOGS_PANEL_CHANNEL || LOGS_CHANNEL_ID;
     if (!channelId) return;
@@ -367,7 +389,6 @@ async function sendLogsPanel() {
     }
 }
 
-// ── Helper: constrói embed !online ────────────────────────────────────────────
 function buildOnlineEmbed() {
     const now = Date.now();
     for (const [sid, info] of Object.entries(presence)) {
@@ -386,7 +407,7 @@ function buildOnlineEmbed() {
             else { timeLeft = keyData.expiry === Infinity ? "Lifetime ♾️" : formatTime(keyData.expiry - now); }
         }
         const discordId = keyData?.discordId || null;
-        const jobId = userJobIds[robloxName] || null;
+        const jobId     = userJobIds[robloxName] || null;
         userMap[robloxName] = { timeLeft, status, discordId, jobId };
     }
     const userList = Object.entries(userMap);
@@ -408,10 +429,7 @@ function buildOnlineEmbed() {
     return embed;
 }
 
-// ── Listener de interações do Bob Logs ───────────────────────────────────────
 clientLogs.on(Events.InteractionCreate, async (interaction) => {
-
-    // ── Modais (respostas de formulários) ─────────────────────────────────────
     if (interaction.isModalSubmit()) {
         await handleLogsModal(interaction);
         return;
@@ -422,15 +440,11 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
 
     const id = interaction.customId;
 
-    // ── Botões que NÃO precisam de modal (ação imediata) ─────────────────────
     if (id === "logs_online") {
         await interaction.deferReply({ ephemeral: false });
         const sentMsg = await interaction.editReply({ embeds: [buildOnlineEmbed()] });
-
         if (!global.onlineIntervals) global.onlineIntervals = {};
-        if (global.onlineIntervals[interaction.channelId]) {
-            clearInterval(global.onlineIntervals[interaction.channelId]);
-        }
+        if (global.onlineIntervals[interaction.channelId]) clearInterval(global.onlineIntervals[interaction.channelId]);
         global.onlineIntervals[interaction.channelId] = setInterval(async () => {
             await sentMsg.edit({ embeds: [buildOnlineEmbed()] }).catch(() => {
                 clearInterval(global.onlineIntervals[interaction.channelId]);
@@ -459,7 +473,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         const paused = all.filter(k => k.paused);
         const lt     = all.filter(k => k.expiry === Infinity);
         const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
-        const embed = new EmbedBuilder()
+        const embed  = new EmbedBuilder()
             .setTitle("📊 Estatísticas Bob Joiner")
             .setColor(0x5865F2)
             .addFields(
@@ -481,8 +495,8 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         if (!ks.length) { await interaction.editReply({ content: "Nenhuma chave ativa." }); return; }
         const embed = new EmbedBuilder().setTitle("🔑 Chaves Ativas").setColor(0x5865F2).setTimestamp();
         const lines = ks.map(k => {
-            const d = keys[k];
-            const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
+            const d       = keys[k];
+            const t       = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
             const discord = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
             const hwid    = d.hwid ? `HWID: ${d.hwid.substring(0, 6)}...` : "Livre";
             return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${discord} *(${hwid})*`;
@@ -503,7 +517,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
 
     if (id === "logs_blocked") {
         await interaction.deferReply({ ephemeral: true });
-        const now = Date.now();
+        const now    = Date.now();
         const active = Object.entries(blockedIPs).filter(([, until]) => now < until);
         if (!active.length) { await interaction.editReply({ content: "Nenhum IP bloqueado no momento." }); return; }
         const lines = active.map(([ip, until]) => `• \`${ip}\` — ainda ${Math.ceil((until - now) / 1000)}s bloqueado`);
@@ -523,7 +537,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
 
-    // ── Botões que ABREM MODAL ────────────────────────────────────────────────
     const modalMap = {
         logs_create:    buildModal_create,
         logs_lifetime:  buildModal_lifetime,
@@ -540,25 +553,17 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         logs_cleanlogs: buildModal_cleanlogs,
     };
 
-    if (modalMap[id]) {
-        await interaction.showModal(modalMap[id]());
-    }
+    if (modalMap[id]) await interaction.showModal(modalMap[id]());
 });
 
-// ── Handler de modais submetidos ──────────────────────────────────────────────
 async function handleLogsModal(interaction) {
     await interaction.deferReply({ ephemeral: true });
-    const id = interaction.customId;
-
-    // Helper local para verificar senha
-    const getField = (name) => {
-        try { return interaction.fields.getTextInputValue(name); } catch { return ""; }
-    };
+    const id        = interaction.customId;
+    const getField  = (name) => { try { return interaction.fields.getTextInputValue(name); } catch { return ""; } };
     const wrongPass = (pass) => pass !== ADMIN_PASS;
 
-    // ── modal_create ──────────────────────────────────────────────────────────
     if (id === "modal_create") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const h    = parseInt(getField("key_h"))  || 0;
         const m    = parseInt(getField("key_m"))  || 0;
         const pass = getField("key_pass");
@@ -568,24 +573,26 @@ async function handleLogsModal(interaction) {
         if (dur <= 0) { await interaction.editReply({ content: "❌ Duração inválida!" }); return; }
         keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
         await saveKey(name);
+        console.log(`[ADMIN] Key criada: "${name}" duração: ${formatTime(dur)}`);
         await interaction.editReply({ content: `✅ Chave \`${name}\` criada! Duração: **${formatTime(dur)}**` });
         return;
     }
 
-    // ── modal_lifetime ────────────────────────────────────────────────────────
     if (id === "modal_lifetime") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
+        // FIX 4: verifica se key já existe antes de criar lifetime
+        if (findKey(name)) { await interaction.editReply({ content: `❌ Chave \`${name}\` já existe!` }); return; }
         keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
         await saveKey(name);
+        console.log(`[ADMIN] Key lifetime criada: "${name}"`);
         await interaction.editReply({ content: `✅ Chave \`${name}\` criada como **Lifetime ♾️**!` });
         return;
     }
 
-    // ── modal_revoke ──────────────────────────────────────────────────────────
     if (id === "modal_revoke") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
         if (name.toLowerCase() === "all") {
@@ -595,16 +602,14 @@ async function handleLogsModal(interaction) {
         } else {
             const t = findKey(name);
             if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
-            delete keys[t];
-            await deleteKey(t);
+            delete keys[t]; await deleteKey(t);
             await interaction.editReply({ content: `🗑️ Chave \`${t}\` removida.` });
         }
         return;
     }
 
-    // ── modal_pause ───────────────────────────────────────────────────────────
     if (id === "modal_pause") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
         if (name.toLowerCase() === "all") {
@@ -631,9 +636,8 @@ async function handleLogsModal(interaction) {
         return;
     }
 
-    // ── modal_reset ───────────────────────────────────────────────────────────
     if (id === "modal_reset") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
         if (name.toLowerCase() === "all") {
@@ -649,9 +653,8 @@ async function handleLogsModal(interaction) {
         return;
     }
 
-    // ── modal_addtime ─────────────────────────────────────────────────────────
     if (id === "modal_addtime") {
-        const name  = getField("key_name");
+        const name  = getField("key_name").trim();
         const h     = parseInt(getField("key_h")) || 0;
         const m     = parseInt(getField("key_m")) || 0;
         const pass  = getField("key_pass");
@@ -679,9 +682,8 @@ async function handleLogsModal(interaction) {
         return;
     }
 
-    // ── modal_setexpiry ───────────────────────────────────────────────────────
     if (id === "modal_setexpiry") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const h    = parseInt(getField("key_h")) || 0;
         const m    = parseInt(getField("key_m")) || 0;
         const pass = getField("key_pass");
@@ -698,9 +700,8 @@ async function handleLogsModal(interaction) {
         return;
     }
 
-    // ── modal_extend ──────────────────────────────────────────────────────────
     if (id === "modal_extend") {
-        const name = getField("key_name");
+        const name = getField("key_name").trim();
         const h    = parseInt(getField("key_h")) || 0;
         const m    = parseInt(getField("key_m")) || 0;
         const pass = getField("key_pass");
@@ -716,66 +717,59 @@ async function handleLogsModal(interaction) {
         return;
     }
 
-    // ── modal_transfer ────────────────────────────────────────────────────────
     if (id === "modal_transfer") {
-        const oldName = getField("key_old");
-        const newName = getField("key_new");
+        const oldName = getField("key_old").trim();
+        const newName = getField("key_new").trim();
         const pass    = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
         const t = findKey(oldName);
         if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
         if (findKey(newName)) { await interaction.editReply({ content: `❌ Chave \`${newName}\` já existe!` }); return; }
         keys[newName] = { ...keys[t] };
-        delete keys[t];
-        await deleteKey(t);
-        await saveKey(newName);
+        delete keys[t]; await deleteKey(t); await saveKey(newName);
         await interaction.editReply({ content: `✅ Chave transferida de \`${t}\` para \`${newName}\`!` });
         return;
     }
 
-    // ── modal_sethwid ─────────────────────────────────────────────────────────
     if (id === "modal_sethwid") {
-        const name = getField("key_name");
-        const hwid = getField("key_hwid");
+        const name = getField("key_name").trim();
+        const hwid = getField("key_hwid").trim() || null;
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
         const t = findKey(name);
         if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
-        keys[t].hwid = hwid;
-        await saveKey(t);
+        keys[t].hwid = hwid; await saveKey(t);
         await interaction.editReply({ content: `✅ HWID de \`${t}\` definido para \`${hwid}\`!` });
         return;
     }
 
-    // ── modal_lookup ──────────────────────────────────────────────────────────
     if (id === "modal_lookup") {
-        const name = getField("key_name");
-        const t = findKey(name);
+        const name = getField("key_name").trim();
+        const t    = findKey(name);
         if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
-        const d = keys[t];
+        const d        = keys[t];
         const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
         const status   = d.paused ? "⏸️ Pausada" : "✅ Ativa";
         const hwid     = d.hwid ? `\`${d.hwid.substring(0, 12)}...\`` : "Nenhum (Livre)";
         const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
         const jobId    = d.discordId ? (userJobIds[d.discordId] || "Nenhum") : "Nenhum";
-        const embed = new EmbedBuilder()
+        const embed    = new EmbedBuilder()
             .setTitle(`🔍 Info: ${t}`)
             .setColor(d.paused ? 0xFFA000 : 0x00C853)
             .addFields(
-                { name: "⏱️ Tempo Restante", value: timeLeft,       inline: true },
-                { name: "📌 Status",          value: status,         inline: true },
-                { name: "💻 HWID",            value: hwid,           inline: false },
-                { name: "👤 Discord",          value: discord,        inline: true },
-                { name: "🎮 JobID",            value: String(jobId),  inline: true }
+                { name: "⏱️ Tempo Restante", value: timeLeft,      inline: true },
+                { name: "📌 Status",          value: status,        inline: true },
+                { name: "💻 HWID",            value: hwid,          inline: false },
+                { name: "👤 Discord",          value: discord,       inline: true },
+                { name: "🎮 JobID",            value: String(jobId), inline: true }
             )
             .setTimestamp();
         await interaction.editReply({ embeds: [embed] });
         return;
     }
 
-    // ── modal_unblock ─────────────────────────────────────────────────────────
     if (id === "modal_unblock") {
-        const ip   = getField("ip_address");
+        const ip   = getField("ip_address").trim();
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
         if (blockedIPs[ip]) { delete blockedIPs[ip]; await interaction.editReply({ content: `✅ IP \`${ip}\` desbloqueado.` }); }
@@ -783,7 +777,6 @@ async function handleLogsModal(interaction) {
         return;
     }
 
-    // ── modal_cleanlogs ───────────────────────────────────────────────────────
     if (id === "modal_cleanlogs") {
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
@@ -795,200 +788,113 @@ async function handleLogsModal(interaction) {
 }
 
 // ── Builders de Modal ─────────────────────────────────────────────────────────
-
 function buildModal_create() {
     return new ModalBuilder().setCustomId("modal_create").setTitle("🔑 Criar Key")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_h").setLabel("Horas").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 24")
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_m").setLabel("Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 0")
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 24")),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 0")),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_lifetime() {
     return new ModalBuilder().setCustomId("modal_lifetime").setTitle("♾️ Criar Key Lifetime")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_revoke() {
     return new ModalBuilder().setCustomId("modal_revoke").setTitle("🗑️ Revogar Key")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_pause() {
     return new ModalBuilder().setCustomId("modal_pause").setTitle("⏸️ Pausar / Retomar Key")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_reset() {
     return new ModalBuilder().setCustomId("modal_reset").setTitle("🔄 Resetar HWID")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_addtime() {
     return new ModalBuilder().setCustomId("modal_addtime").setTitle("⏱️ Adicionar Tempo")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 12")
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 30")
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 12")),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 30")),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_setexpiry() {
     return new ModalBuilder().setCustomId("modal_setexpiry").setTitle("📅 Redefinir Expiração")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_h").setLabel("Novo tempo — Horas").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_m").setLabel("Novo tempo — Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Novo tempo — Horas").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Novo tempo — Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_extend() {
     return new ModalBuilder().setCustomId("modal_extend").setTitle("➕ Estender Key")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_transfer() {
     return new ModalBuilder().setCustomId("modal_transfer").setTitle("🔀 Transferir Key")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_old").setLabel("Nome atual da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_new").setLabel("Novo nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_old").setLabel("Nome atual da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_new").setLabel("Novo nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_sethwid() {
     return new ModalBuilder().setCustomId("modal_sethwid").setTitle("💻 Definir HWID")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_hwid").setLabel("Novo HWID").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_hwid").setLabel("Novo HWID").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_lookup() {
     return new ModalBuilder().setCustomId("modal_lookup").setTitle("🔍 Lookup Key")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_unblock() {
     return new ModalBuilder().setCustomId("modal_unblock").setTitle("🔓 Desbloquear IP")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("ip_address").setLabel("Endereço IP").setStyle(TextInputStyle.Short).setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip_address").setLabel("Endereço IP").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
-
 function buildModal_cleanlogs() {
     return new ModalBuilder().setCustomId("modal_cleanlogs").setTitle("🧹 Limpar Logs")
         .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true)
-            )
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
         );
 }
 
-// ── Comandos de texto como fallback (ainda funcionam) ─────────────────────────
+// ── Comandos de texto como fallback ───────────────────────────────────────────
 clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
-
-    // Reenvia o painel ao digitar !logspanel
-    if (message.content === "!logspanel") {
-        await sendLogsPanel();
-        return;
-    }
-
+    if (message.content === "!logspanel") { await sendLogsPanel(); return; }
     if (!message.content.startsWith("!")) return;
-    const args = message.content.slice(1).trim().split(/ +/);
-    const cmd  = args.shift().toLowerCase();
+    const args      = message.content.slice(1).trim().split(/ +/);
+    const cmd       = args.shift().toLowerCase();
     const wrongPass = (pass) => pass !== ADMIN_PASS;
 
     switch (cmd) {
@@ -1013,7 +919,7 @@ clientLogs.on("messageCreate", async (message) => {
             break;
         }
         case "blocked": {
-            const now = Date.now();
+            const now    = Date.now();
             const active = Object.entries(blockedIPs).filter(([, until]) => now < until);
             if (!active.length) { message.reply("Nenhum IP bloqueado."); break; }
             message.reply("🔒 **IPs Bloqueados:**\n" + active.map(([ip, u]) => `• \`${ip}\` — ${Math.ceil((u - now) / 1000)}s`).join("\n"));
@@ -1038,14 +944,14 @@ clientLogs.on("messageCreate", async (message) => {
             const paused = all.filter(k => k.paused);
             const lt     = all.filter(k => k.expiry === Infinity);
             const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
-            const embed = new EmbedBuilder().setTitle("📊 Estatísticas Bob Joiner").setColor(0x5865F2)
+            const embed  = new EmbedBuilder().setTitle("📊 Estatísticas Bob Joiner").setColor(0x5865F2)
                 .addFields(
-                    { name: "🔑 Total",   value: String(all.length),       inline: true },
-                    { name: "✅ Ativas",  value: String(active.length),    inline: true },
-                    { name: "⏸️ Pausadas",value: String(paused.length),    inline: true },
-                    { name: "♾️ Lifetime",value: String(lt.length),        inline: true },
-                    { name: "🟢 Online",  value: String(online.length),    inline: true },
-                    { name: "📡 Brainrots",value: String(brainrots.length),inline: true }
+                    { name: "🔑 Total",    value: String(all.length),       inline: true },
+                    { name: "✅ Ativas",   value: String(active.length),    inline: true },
+                    { name: "⏸️ Pausadas", value: String(paused.length),    inline: true },
+                    { name: "♾️ Lifetime", value: String(lt.length),        inline: true },
+                    { name: "🟢 Online",   value: String(online.length),    inline: true },
+                    { name: "📡 Brainrots",value: String(brainrots.length), inline: true }
                 ).setTimestamp();
             message.reply({ embeds: [embed] });
             break;
@@ -1055,22 +961,25 @@ clientLogs.on("messageCreate", async (message) => {
             if (!ks.length) { message.reply("Nenhuma chave ativa."); break; }
             const embed = new EmbedBuilder().setTitle("🔑 Chaves Ativas").setColor(0x5865F2).setTimestamp();
             embed.setDescription(ks.map(k => {
-                const d = keys[k]; const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
+                const d = keys[k];
+                const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
                 return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*"}`;
             }).join("\n").substring(0, 4000));
             message.reply({ embeds: [embed] });
             break;
         }
         case "lookup": {
-            const [name] = args; if (!name) { message.reply("Uso: `!lookup <nome>`"); break; }
-            const t = findKey(name); if (!t) { message.reply("❌ Chave não encontrada."); break; }
-            const d = keys[t];
+            const [name] = args;
+            if (!name) { message.reply("Uso: `!lookup <nome>`"); break; }
+            const t = findKey(name);
+            if (!t) { message.reply("❌ Chave não encontrada."); break; }
+            const d    = keys[t];
             const embed = new EmbedBuilder().setTitle(`🔍 Info: ${t}`).setColor(d.paused ? 0xFFA000 : 0x00C853)
                 .addFields(
-                    { name: "⏱️ Tempo", value: d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now()), inline: true },
-                    { name: "📌 Status", value: d.paused ? "⏸️ Pausada" : "✅ Ativa", inline: true },
-                    { name: "💻 HWID",  value: d.hwid ? `\`${d.hwid.substring(0,12)}...\`` : "Livre", inline: false },
-                    { name: "👤 Discord", value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*", inline: true }
+                    { name: "⏱️ Tempo",   value: d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now()), inline: true },
+                    { name: "📌 Status",  value: d.paused ? "⏸️ Pausada" : "✅ Ativa",                                       inline: true },
+                    { name: "💻 HWID",    value: d.hwid ? `\`${d.hwid.substring(0, 12)}...\`` : "Livre",                    inline: false },
+                    { name: "👤 Discord", value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*",                   inline: true }
                 ).setTimestamp();
             message.reply({ embeds: [embed] });
             break;
@@ -1092,7 +1001,7 @@ clientLogs.on("messageCreate", async (message) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ─── BOT PAINEL (usuários) — sem alterações ───────────────────────────────────
+// ─── BOT PAINEL (usuários) ────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 const clientPanel = new Client({
     intents: [
@@ -1115,9 +1024,9 @@ function buildPanelEmbed() {
             "If you're a buyer, click on the buttons below to redeem your key, get the script or get your role"
         )
         .addFields(
-            { name: "🔑 Redeem Key",  value: "Place to validate your Key",                              inline: false },
-            { name: "📋 View Script", value: "Shows the **Bob Joiner** Script (Key Required)",          inline: false },
-            { name: "📊 Key Info",    value: "Shows your Key Status (Key Required)",                    inline: false },
+            { name: "🔑 Redeem Key",  value: "Place to validate your Key",                                   inline: false },
+            { name: "📋 View Script", value: "Shows the **Bob Joiner** Script (Key Required)",               inline: false },
+            { name: "📊 Key Info",    value: "Shows your Key Status (Key Required)",                         inline: false },
             { name: "⚙️ Reset HWID",  value: "Reset the Hardware Identification of your Key (Key Required)", inline: false }
         );
 }
@@ -1163,25 +1072,21 @@ clientPanel.on("messageCreate", async (message) => {
         const state = awaitingInput[message.author.id];
         if (!state) return;
 
+        const key     = message.content.trim();
+        const keyName = findKey(key);
+
+        if (!keyName) return message.reply("❌ Key não encontrada!");
+        const d = keys[keyName];
+        if (d.paused) return message.reply("⏸️ Sua key está pausada.");
+        if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
+
         if (state.step === "redeem_key") {
-            const key = message.content.trim();
-            const keyName = findKey(key);
-            if (!keyName) return message.reply("❌ Key não encontrada!");
-            const d = keys[keyName];
-            if (d.paused) return message.reply("⏸️ Sua key está pausada.");
-            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
             delete awaitingInput[message.author.id];
             const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
             return message.reply(`✅ Key válida! Tempo restante: **${timeLeft}**`);
         }
 
         if (state.step === "script_key") {
-            const key = message.content.trim();
-            const keyName = findKey(key);
-            if (!keyName) return message.reply("❌ Key não encontrada!");
-            const d = keys[keyName];
-            if (d.paused) return message.reply("⏸️ Sua key está pausada.");
-            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
             delete awaitingInput[message.author.id];
             return message.reply(
                 "📋 **Bob Joiner Script**\n\n" +
@@ -1192,12 +1097,6 @@ clientPanel.on("messageCreate", async (message) => {
         }
 
         if (state.step === "role_key") {
-            const key = message.content.trim();
-            const keyName = findKey(key);
-            if (!keyName) return message.reply("❌ Key não encontrada!");
-            const d = keys[keyName];
-            if (d.paused) return message.reply("⏸️ Sua key está pausada.");
-            if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
             if (d.discordId && d.discordId !== message.author.id)
                 return message.reply("❌ Essa key já está vinculada a outro Discord!");
             d.discordId = message.author.id;
@@ -1206,7 +1105,7 @@ clientPanel.on("messageCreate", async (message) => {
             const ROLE_ID = process.env.BUYER_ROLE_ID;
             if (ROLE_ID && state.guildId) {
                 try {
-                    const guild = await clientPanel.guilds.fetch(state.guildId);
+                    const guild  = await clientPanel.guilds.fetch(state.guildId);
                     const member = await guild.members.fetch(message.author.id);
                     await member.roles.add(ROLE_ID);
                     return message.reply(`✅ Discord vinculado à key \`${keyName}\` e cargo adicionado!`);
@@ -1219,9 +1118,6 @@ clientPanel.on("messageCreate", async (message) => {
         }
 
         if (state.step === "hwid_key") {
-            const key = message.content.trim();
-            const keyName = findKey(key);
-            if (!keyName) return message.reply("❌ Key não encontrada!");
             keys[keyName].hwid = null;
             kicked[keyName.toLowerCase()] = Date.now();
             await saveKey(keyName);
@@ -1230,13 +1126,9 @@ clientPanel.on("messageCreate", async (message) => {
         }
 
         if (state.step === "stats_key") {
-            const key = message.content.trim();
-            const keyName = findKey(key);
-            if (!keyName) return message.reply("❌ Key não encontrada!");
-            const d = keys[keyName];
             const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
             const status   = d.paused ? "⏸️ Pausada" : "✅ Ativa";
-            const hwid     = d.hwid ? `\`${d.hwid.substring(0,8)}...\`` : "Nenhum (Livre)";
+            const hwid     = d.hwid ? `\`${d.hwid.substring(0, 8)}...\`` : "Nenhum (Livre)";
             const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
             delete awaitingInput[message.author.id];
             const embed = new EmbedBuilder()
@@ -1303,14 +1195,16 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ─── ENDPOINTS ────────────────────────────────────────────────────────────────
-
 app.get("/health", (req, res) => res.json({ status: "ok", time: Date.now() }));
 app.get("/",       (req, res) => res.send("<h1>Bob API v10 — Online ✅</h1>"));
 
+// FIX 5: /validate com logs detalhados
 app.get("/validate", requireClientHeader, (req, res) => {
     const { key, secret, hwid } = req.query;
+    console.log(`[VALIDATE] key="${key}" hwid="${hwid}" secret_ok=${secret === SCRIPT_SECRET} keys_mem=${Object.keys(keys).length}`);
     const r = checkKey(key, secret, hwid);
-    if (!r.ok) return res.status(403).send("Erro: " + r.error);
+    console.log(`[VALIDATE] resultado: ${r.ok ? "OK" : r.error}`);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
     const timeLeft = r.data.expiry === Infinity ? Infinity : r.data.expiry - Date.now();
     res.json({ status: "success", time_left: timeLeft });
 });
@@ -1354,10 +1248,10 @@ app.post("/presence", requireClientHeader, async (req, res) => {
     const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query;
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
-    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: key || "" };
+    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: (key || "").trim() };
     if (jobId && name) userJobIds[name] = jobId;
     if (discordId && r.keyName) {
-        const d = keys[r.keyName];
+        const d       = keys[r.keyName];
         const cleanId = String(discordId).replace(/\D/g, "");
         if (cleanId.length >= 17 && cleanId.length <= 20) {
             if (!d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); }
@@ -1371,7 +1265,7 @@ app.get("/presence", requireClientHeader, (req, res) => {
     const { key, secret, hwid } = req.query;
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
-    const now = Date.now();
+    const now    = Date.now();
     const active = {};
     for (const [sid, info] of Object.entries(presence)) {
         if (now - info.lastSeen < 30000) active[info.name] = true;
@@ -1395,9 +1289,14 @@ app.post("/push-brainrot", requireClientHeader, (req, res) => {
     const { secret, title, description, jobId, value, players } = req.body;
     if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido" });
     const payload = {
-        id: Date.now().toString(), title: title || "Brainrot", description: description || "",
-        brainrot: title || "Brainrot", name: title || "Brainrot",
-        jobId: xorObfuscate(jobId) || null, value: value || "0", players: players || "N/A"
+        id:          Date.now().toString(),
+        title:       title       || "Brainrot",
+        description: description || "",
+        brainrot:    title       || "Brainrot",
+        name:        title       || "Brainrot",
+        jobId:       xorObfuscate(jobId) || null,
+        value:       value       || "0",
+        players:     players     || "N/A"
     };
     brainrots.push(payload);
     if (brainrots.length > 100) brainrots.shift();
