@@ -82,7 +82,6 @@ async function saveKey(name) {
         const raw = { ...keys[name] };
         if (raw.expiry    === Infinity) raw.expiry    = LIFETIME_VALUE;
         if (raw.remaining === Infinity) raw.remaining = LIFETIME_VALUE;
-        // FIX: "new: true" em vez de "returnDocument: after"
         await KeyModel.findOneAndUpdate({ name }, { name, ...raw }, { upsert: true, new: true });
     } catch (e) { console.error("[DB] Erro ao salvar key:", e.message); }
 }
@@ -254,7 +253,6 @@ async function confirmarPagamento(user, hours, channel) {
 const clientNotifier = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildWebhooks]
 });
-// FIX: "ready" em vez de "clientReady"
 clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 clientNotifier.on("messageCreate", async (message) => {
     if (message.author.bot && message.author.id === clientNotifier.user?.id) return;
@@ -281,7 +279,6 @@ clientNotifier.on("messageCreate", async (message) => {
 const clientLogs = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
-// FIX: "ready" em vez de "clientReady"
 clientLogs.on("ready", async () => {
     console.log(`[LOGS] Online: ${clientLogs.user.tag}`);
     await sendLogsPanel();
@@ -344,37 +341,66 @@ async function sendLogsPanel() {
     } catch (e) { console.error("[LOGS] Erro ao enviar painel:", e.message); }
 }
 
+// ─── BUILD ONLINE EMBED ───────────────────────────────────────────────────────
+// Lista TODAS as keys ativas do banco.
+// Formato: ✅ @Discord (NomeNoJogo) — ⏱️ 2h 30m
+// O nome no jogo vem do presence (último heartbeat), se disponível.
+// Se a pessoa sair do jogo, a key continua aparecendo — apenas o nome some.
 function buildOnlineEmbed() {
     const now = Date.now();
-    for (const [sid, info] of Object.entries(presence)) {
-        if (now - info.lastSeen >= 30000) delete presence[sid];
-    }
-    const userMap = {};
+
+    // Monta mapa keyName -> robloxName usando o presence mais recente
+    const robloxByKey = {};
     for (const [, info] of Object.entries(presence)) {
-        if (now - info.lastSeen >= 30000) continue;
-        const robloxName = info.name || "?";
-        if (userMap[robloxName]) continue;
         const keyName = info.key ? findKey(info.key) : null;
-        const keyData = keyName ? keys[keyName] : null;
-        let timeLeft = "?", status = "✅";
-        if (keyData) {
-            if (keyData.paused) { timeLeft = formatTime(keyData.remaining); status = "⏸️"; }
-            else { timeLeft = keyData.expiry === Infinity ? "Lifetime ♾️" : formatTime(keyData.expiry - now); }
+        if (keyName && !robloxByKey[keyName] && (now - info.lastSeen < 120000)) {
+            robloxByKey[keyName] = info.name || null;
         }
-        userMap[robloxName] = { timeLeft, status, discordId: keyData?.discordId || null, jobId: userJobIds[robloxName] || null };
     }
-    const userList = Object.entries(userMap);
-    const embed = new EmbedBuilder().setTitle("🟢 Usuários Online no Script").setColor(0x00C853)
-        .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online` }).setTimestamp();
-    if (!userList.length) {
-        embed.setDescription("Nenhum usuário online no momento.");
-    } else {
-        embed.setDescription(userList.map(([n, d]) => {
-            const mention = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
-            const jobPart = d.jobId ? ` | 🎮 \`${d.jobId.substring(0, 8)}...\`` : "";
-            return `${d.status} **${n}** — ${mention} — ⏱️ \`${d.timeLeft}\`${jobPart}`;
-        }).join("\n"));
+
+    // Filtra keys ativas (inclui pausadas)
+    const activeKeys = Object.entries(keys).filter(([, d]) => {
+        if (d.paused) return true;
+        if (d.expiry === Infinity) return true;
+        return d.expiry - now > 0;
+    });
+
+    const embed = new EmbedBuilder()
+        .setTitle("📋 Keys Ativas — Bob Joiner")
+        .setColor(0x5865F2)
+        .setFooter({ text: `Bob Joiner • ${activeKeys.length} key(s) ativa(s) • Atualizado` })
+        .setTimestamp();
+
+    if (!activeKeys.length) {
+        embed.setDescription("Nenhuma key ativa no momento.");
+        return embed;
     }
+
+    const lines = activeKeys.map(([keyName, d]) => {
+        // Ícone de status
+        const status = d.paused ? "⏸️" : "✅";
+
+        // Mention Discord
+        const mention = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
+
+        // Nome no jogo — vem do presence; se não estiver jogando mostra traço
+        const robloxName = robloxByKey[keyName] || "—";
+
+        // Tempo restante
+        let timeStr;
+        if (d.paused) {
+            timeStr = formatTime(d.remaining);
+        } else if (d.expiry === Infinity) {
+            timeStr = "Lifetime ♾️";
+        } else {
+            timeStr = formatTime(d.expiry - now);
+        }
+
+        // Formato: ✅ @LanzinUSUARIO (NZW_SLOw) — ⏱️ 2h 30m
+        return `${status} ${mention} **(${robloxName})** — ⏱️ \`${timeStr}\``;
+    });
+
+    embed.setDescription(lines.join("\n").substring(0, 4000));
     return embed;
 }
 
@@ -768,7 +794,6 @@ function buildPanelRows() {
     ];
 }
 
-// FIX: "ready" em vez de "clientReady"
 clientPanel.on("ready", async () => {
     console.log(`[PANEL] Online: ${clientPanel.user.tag}`);
     if (PANEL_CHANNEL_ID) {
@@ -853,7 +878,6 @@ function buildShopRows() {
     return [row];
 }
 
-// FIX: "ready" em vez de "clientReady"
 clientPayment.on("ready", async () => {
     console.log(`[PAYMENT] Online: ${clientPayment.user.tag}`);
     try {
@@ -873,7 +897,6 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
     if (id.startsWith("buy_") && id !== "buy_minhakey") {
         const plan = PLANS.find(p => p.value === id.replace("buy_", ""));
         if (!plan) return interaction.reply({ content: "❌ Plano inválido!", ephemeral: true });
-        // FIX: "new: true" em vez de "returnDocument: after"
         await PendingPayment.findOneAndUpdate(
             { discordId: user.id },
             { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, label: plan.label },
