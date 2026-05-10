@@ -467,7 +467,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
                 clearInterval(global.onlineIntervals[interaction.channelId]);
                 delete global.onlineIntervals[interaction.channelId];
             });
-        }, 5000);
+        }, 60000);
         return;
     }
     if (id === "logs_stoponline") {
