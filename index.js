@@ -200,11 +200,10 @@ const formatTime = (ms) => {
     if (ms === Infinity) return "Lifetime ♾️";
     if (ms <= 0) return "Expirado";
     let t = Math.floor(ms / 1000);
-    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
     const p = [];
     if (h > 0) p.push(h + "h");
-    if (m > 0) p.push(m + "m");
-    if (s > 0 || !p.length) p.push(s + "s");
+    p.push(m + "m");
     return p.join(" ");
 };
 
@@ -388,7 +387,7 @@ function buildOnlineEmbed() {
     const embed = new EmbedBuilder()
         .setTitle("🟢 Usuários Online no Script")
         .setColor(0x00C853)
-        .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s` })
+        .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online` })
         .setTimestamp();
     if (userList.length === 0) {
         embed.setDescription("Nenhum usuário online no momento.");
@@ -429,7 +428,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
                 clearInterval(global.onlineIntervals[interaction.channelId]);
                 delete global.onlineIntervals[interaction.channelId];
             });
-        }, 5000);
+        }, 60000);
         return;
     }
     if (id === "logs_stoponline") {
@@ -834,7 +833,7 @@ clientLogs.on("messageCreate", async (message) => {
                     clearInterval(global.onlineIntervals[message.channel.id]);
                     delete global.onlineIntervals[message.channel.id];
                 });
-            }, 5000);
+            }, 60000);
             break;
         }
         case "stoponline": {
