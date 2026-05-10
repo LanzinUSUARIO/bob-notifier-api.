@@ -31,6 +31,7 @@ const PIX_KEY      = process.env.PIX_KEY      || "joaojanela2009@gmail.com";
 const PIX_NAME     = process.env.PIX_NAME     || "João";
 const BUY_CHANNEL  = process.env.BUY_CHANNEL  || "1503090485143666828";
 const PLANS = [
+    { label: "1 Hora",  value: "1h", price: 5,  hours: 1, emoji: "🕐" },
     { label: "2 Horas", value: "2h", price: 10, hours: 2, emoji: "⏱️" },
     { label: "4 Horas", value: "4h", price: 20, hours: 4, emoji: "⚡" },
 ];
