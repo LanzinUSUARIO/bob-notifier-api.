@@ -23,7 +23,6 @@ function xorObfuscate(value) {
     return Buffer.from(result, "binary").toString("base64");
 }
 
-// ─── CONSTANTE PARA LIFETIME (Infinity não persiste no MongoDB) ───────────────
 const LIFETIME_VALUE = 9999999999999;
 
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
@@ -51,22 +50,14 @@ async function loadKeys() {
         const docs = await KeyModel.find({});
         let expired = 0;
         for (const d of docs) {
-            // FIX: Converte LIFETIME_VALUE de volta para Infinity
             const expiry    = d.expiry    >= LIFETIME_VALUE ? Infinity : d.expiry;
             const remaining = d.remaining >= LIFETIME_VALUE ? Infinity : d.remaining;
-
             if (expiry !== Infinity && expiry - Date.now() <= 0) {
                 await KeyModel.deleteOne({ name: d.name });
                 expired++;
                 continue;
             }
-            keys[d.name] = {
-                expiry,
-                paused:    d.paused,
-                remaining,
-                hwid:      d.hwid      || null,
-                discordId: d.discordId || null
-            };
+            keys[d.name] = { expiry, paused: d.paused, remaining, hwid: d.hwid || null, discordId: d.discordId || null };
         }
         console.log(`[DB] ${Object.keys(keys).length} keys carregadas. ${expired} expiradas removidas.`);
     } catch (e) {
@@ -76,15 +67,10 @@ async function loadKeys() {
 
 async function saveKey(name) {
     try {
-        // FIX: Converte Infinity para LIFETIME_VALUE antes de salvar no MongoDB
         const raw = { ...keys[name] };
         if (raw.expiry    === Infinity) raw.expiry    = LIFETIME_VALUE;
         if (raw.remaining === Infinity) raw.remaining = LIFETIME_VALUE;
-        await KeyModel.findOneAndUpdate(
-            { name },
-            { name, ...raw },
-            { upsert: true, new: true }
-        );
+        await KeyModel.findOneAndUpdate({ name }, { name, ...raw }, { upsert: true, new: true });
     } catch (e) {
         console.error("[DB] Erro ao salvar key:", e.message);
     }
@@ -98,7 +84,6 @@ async function deleteKey(name) {
     }
 }
 
-// ─── Limpa keys expiradas periodicamente ─────────────────────────────────────
 setInterval(async () => {
     const now = Date.now();
     for (const [name, data] of Object.entries(keys)) {
@@ -223,22 +208,16 @@ const formatTime = (ms) => {
     return p.join(" ");
 };
 
-// FIX 1: findKey com .trim() — evita espaços invisíveis quebrando a busca
 const findKey = (name) =>
     Object.keys(keys).find(k => k.toLowerCase() === (name || "").trim().toLowerCase());
 
-// FIX 2 + 3: checkKey com trim na key/hwid e trata hwid vazio como null
 const checkKey = (key, secret, hwid) => {
     if (secret !== SCRIPT_SECRET) return { ok: false, error: "Secret invalido" };
-
     const keyClean  = (key  || "").trim();
     const hwidClean = (hwid || "").trim() || null;
-
     console.log(`[CHECKKEY] key="${keyClean}" hwid="${hwidClean}" keys_mem=${Object.keys(keys).length}`);
-
     const keyName = findKey(keyClean);
     const data    = keys[keyName];
-
     if (!data)       return { ok: false, error: "Chave nao existe" };
     if (data.paused) return { ok: false, error: "Chave pausada" };
     if (data.expiry !== Infinity && data.expiry - Date.now() <= 0) {
@@ -246,8 +225,6 @@ const checkKey = (key, secret, hwid) => {
         deleteKey(keyName);
         return { ok: false, error: "Chave expirada" };
     }
-
-    // FIX: Só valida HWID se o script mandou um hwid não-vazio
     if (hwidClean) {
         if (!data.hwid) {
             data.hwid = hwidClean;
@@ -258,7 +235,6 @@ const checkKey = (key, secret, hwid) => {
             return { ok: false, error: "HWID invalido" };
         }
     }
-
     return { ok: true, data, keyName };
 };
 
@@ -306,9 +282,7 @@ clientNotifier.on("messageCreate", async (message) => {
     console.log(`[NOTIFIER] ✅ ${payload.title} | jobId: ${jobId}`);
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ─── BOB LOGS — PAINEL COM BOTÕES ─────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── BOB LOGS ─────────────────────────────────────────────────────────────────
 const clientLogs = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -430,14 +404,9 @@ function buildOnlineEmbed() {
 }
 
 clientLogs.on(Events.InteractionCreate, async (interaction) => {
-    if (interaction.isModalSubmit()) {
-        await handleLogsModal(interaction);
-        return;
-    }
-
+    if (interaction.isModalSubmit()) { await handleLogsModal(interaction); return; }
     if (!interaction.isButton()) return;
     if (!interaction.customId.startsWith("logs_")) return;
-
     const id = interaction.customId;
 
     if (id === "logs_online") {
@@ -453,19 +422,15 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         }, 5000);
         return;
     }
-
     if (id === "logs_stoponline") {
         await interaction.deferReply({ ephemeral: true });
         if (global.onlineIntervals && global.onlineIntervals[interaction.channelId]) {
             clearInterval(global.onlineIntervals[interaction.channelId]);
             delete global.onlineIntervals[interaction.channelId];
             await interaction.editReply({ content: "⏹️ Atualização do online parada." });
-        } else {
-            await interaction.editReply({ content: "Nenhuma atualização ativa neste canal." });
-        }
+        } else { await interaction.editReply({ content: "Nenhuma atualização ativa neste canal." }); }
         return;
     }
-
     if (id === "logs_stats") {
         await interaction.deferReply({ ephemeral: true });
         const all    = Object.values(keys);
@@ -473,9 +438,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         const paused = all.filter(k => k.paused);
         const lt     = all.filter(k => k.expiry === Infinity);
         const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
-        const embed  = new EmbedBuilder()
-            .setTitle("📊 Estatísticas Bob Joiner")
-            .setColor(0x5865F2)
+        const embed  = new EmbedBuilder().setTitle("📊 Estatísticas Bob Joiner").setColor(0x5865F2)
             .addFields(
                 { name: "🔑 Total de Keys",   value: String(all.length),       inline: true },
                 { name: "✅ Ativas",           value: String(active.length),    inline: true },
@@ -483,20 +446,18 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
                 { name: "♾️ Lifetime",         value: String(lt.length),        inline: true },
                 { name: "🟢 Online agora",     value: String(online.length),    inline: true },
                 { name: "📡 Brainrots (fila)", value: String(brainrots.length), inline: true }
-            )
-            .setTimestamp();
+            ).setTimestamp();
         await interaction.editReply({ embeds: [embed] });
         return;
     }
-
     if (id === "logs_info") {
         await interaction.deferReply({ ephemeral: true });
         const ks = Object.keys(keys);
         if (!ks.length) { await interaction.editReply({ content: "Nenhuma chave ativa." }); return; }
         const embed = new EmbedBuilder().setTitle("🔑 Chaves Ativas").setColor(0x5865F2).setTimestamp();
         const lines = ks.map(k => {
-            const d       = keys[k];
-            const t       = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
+            const d = keys[k];
+            const t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - Date.now());
             const discord = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
             const hwid    = d.hwid ? `HWID: ${d.hwid.substring(0, 6)}...` : "Livre";
             return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${discord} *(${hwid})*`;
@@ -505,7 +466,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ embeds: [embed] });
         return;
     }
-
     if (id === "logs_jobids") {
         await interaction.deferReply({ ephemeral: true });
         const entries = Object.entries(userJobIds);
@@ -514,7 +474,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ content: "🎮 **JobIDs conhecidos:**\n" + lines.join("\n") });
         return;
     }
-
     if (id === "logs_blocked") {
         await interaction.deferReply({ ephemeral: true });
         const now    = Date.now();
@@ -524,7 +483,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ content: "🔒 **IPs Bloqueados:**\n" + lines.join("\n") });
         return;
     }
-
     if (id === "logs_test") {
         await interaction.deferReply({ ephemeral: true });
         const payload = {
@@ -536,23 +494,15 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ content: "✅ Brainrot de teste enviado!" });
         return;
     }
-
     const modalMap = {
-        logs_create:    buildModal_create,
-        logs_lifetime:  buildModal_lifetime,
-        logs_revoke:    buildModal_revoke,
-        logs_pause:     buildModal_pause,
-        logs_reset:     buildModal_reset,
-        logs_addtime:   buildModal_addtime,
-        logs_setexpiry: buildModal_setexpiry,
-        logs_extend:    buildModal_extend,
-        logs_transfer:  buildModal_transfer,
-        logs_sethwid:   buildModal_sethwid,
-        logs_lookup:    buildModal_lookup,
-        logs_unblock:   buildModal_unblock,
+        logs_create: buildModal_create, logs_lifetime: buildModal_lifetime,
+        logs_revoke: buildModal_revoke, logs_pause: buildModal_pause,
+        logs_reset: buildModal_reset,   logs_addtime: buildModal_addtime,
+        logs_setexpiry: buildModal_setexpiry, logs_extend: buildModal_extend,
+        logs_transfer: buildModal_transfer,   logs_sethwid: buildModal_sethwid,
+        logs_lookup: buildModal_lookup, logs_unblock: buildModal_unblock,
         logs_cleanlogs: buildModal_cleanlogs,
     };
-
     if (modalMap[id]) await interaction.showModal(modalMap[id]());
 });
 
@@ -573,24 +523,19 @@ async function handleLogsModal(interaction) {
         if (dur <= 0) { await interaction.editReply({ content: "❌ Duração inválida!" }); return; }
         keys[name] = { expiry: Date.now() + dur, paused: false, remaining: dur, hwid: null, discordId: null };
         await saveKey(name);
-        console.log(`[ADMIN] Key criada: "${name}" duração: ${formatTime(dur)}`);
         await interaction.editReply({ content: `✅ Chave \`${name}\` criada! Duração: **${formatTime(dur)}**` });
         return;
     }
-
     if (id === "modal_lifetime") {
         const name = getField("key_name").trim();
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
-        // FIX 4: verifica se key já existe antes de criar lifetime
         if (findKey(name)) { await interaction.editReply({ content: `❌ Chave \`${name}\` já existe!` }); return; }
         keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null };
         await saveKey(name);
-        console.log(`[ADMIN] Key lifetime criada: "${name}"`);
         await interaction.editReply({ content: `✅ Chave \`${name}\` criada como **Lifetime ♾️**!` });
         return;
     }
-
     if (id === "modal_revoke") {
         const name = getField("key_name").trim();
         const pass = getField("key_pass");
@@ -607,7 +552,6 @@ async function handleLogsModal(interaction) {
         }
         return;
     }
-
     if (id === "modal_pause") {
         const name = getField("key_name").trim();
         const pass = getField("key_pass");
@@ -635,7 +579,6 @@ async function handleLogsModal(interaction) {
         }
         return;
     }
-
     if (id === "modal_reset") {
         const name = getField("key_name").trim();
         const pass = getField("key_pass");
@@ -652,7 +595,6 @@ async function handleLogsModal(interaction) {
         }
         return;
     }
-
     if (id === "modal_addtime") {
         const name  = getField("key_name").trim();
         const h     = parseInt(getField("key_h")) || 0;
@@ -681,7 +623,6 @@ async function handleLogsModal(interaction) {
         }
         return;
     }
-
     if (id === "modal_setexpiry") {
         const name = getField("key_name").trim();
         const h    = parseInt(getField("key_h")) || 0;
@@ -699,7 +640,6 @@ async function handleLogsModal(interaction) {
         await interaction.editReply({ content: `✅ Expiração de \`${t}\` redefinida para **${formatTime(dur)}**!` });
         return;
     }
-
     if (id === "modal_extend") {
         const name = getField("key_name").trim();
         const h    = parseInt(getField("key_h")) || 0;
@@ -716,7 +656,6 @@ async function handleLogsModal(interaction) {
         await interaction.editReply({ content: `✅ \`${t}\` estendida em **${formatTime(extra)}**!` });
         return;
     }
-
     if (id === "modal_transfer") {
         const oldName = getField("key_old").trim();
         const newName = getField("key_new").trim();
@@ -730,7 +669,6 @@ async function handleLogsModal(interaction) {
         await interaction.editReply({ content: `✅ Chave transferida de \`${t}\` para \`${newName}\`!` });
         return;
     }
-
     if (id === "modal_sethwid") {
         const name = getField("key_name").trim();
         const hwid = getField("key_hwid").trim() || null;
@@ -742,7 +680,6 @@ async function handleLogsModal(interaction) {
         await interaction.editReply({ content: `✅ HWID de \`${t}\` definido para \`${hwid}\`!` });
         return;
     }
-
     if (id === "modal_lookup") {
         const name = getField("key_name").trim();
         const t    = findKey(name);
@@ -754,20 +691,17 @@ async function handleLogsModal(interaction) {
         const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
         const jobId    = d.discordId ? (userJobIds[d.discordId] || "Nenhum") : "Nenhum";
         const embed    = new EmbedBuilder()
-            .setTitle(`🔍 Info: ${t}`)
-            .setColor(d.paused ? 0xFFA000 : 0x00C853)
+            .setTitle(`🔍 Info: ${t}`).setColor(d.paused ? 0xFFA000 : 0x00C853)
             .addFields(
                 { name: "⏱️ Tempo Restante", value: timeLeft,      inline: true },
                 { name: "📌 Status",          value: status,        inline: true },
                 { name: "💻 HWID",            value: hwid,          inline: false },
                 { name: "👤 Discord",          value: discord,       inline: true },
                 { name: "🎮 JobID",            value: String(jobId), inline: true }
-            )
-            .setTimestamp();
+            ).setTimestamp();
         await interaction.editReply({ embeds: [embed] });
         return;
     }
-
     if (id === "modal_unblock") {
         const ip   = getField("ip_address").trim();
         const pass = getField("key_pass");
@@ -776,7 +710,6 @@ async function handleLogsModal(interaction) {
         else await interaction.editReply({ content: "IP não estava bloqueado." });
         return;
     }
-
     if (id === "modal_cleanlogs") {
         const pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
@@ -787,116 +720,100 @@ async function handleLogsModal(interaction) {
     }
 }
 
-// ── Builders de Modal ─────────────────────────────────────────────────────────
 function buildModal_create() {
-    return new ModalBuilder().setCustomId("modal_create").setTitle("🔑 Criar Key")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 24")),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 0")),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_create").setTitle("🔑 Criar Key").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 24")),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 0")),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_lifetime() {
-    return new ModalBuilder().setCustomId("modal_lifetime").setTitle("♾️ Criar Key Lifetime")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_lifetime").setTitle("♾️ Criar Key Lifetime").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_revoke() {
-    return new ModalBuilder().setCustomId("modal_revoke").setTitle("🗑️ Revogar Key")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_revoke").setTitle("🗑️ Revogar Key").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_pause() {
-    return new ModalBuilder().setCustomId("modal_pause").setTitle("⏸️ Pausar / Retomar Key")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_pause").setTitle("⏸️ Pausar / Retomar Key").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_reset() {
-    return new ModalBuilder().setCustomId("modal_reset").setTitle("🔄 Resetar HWID")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_reset").setTitle("🔄 Resetar HWID").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_addtime() {
-    return new ModalBuilder().setCustomId("modal_addtime").setTitle("⏱️ Adicionar Tempo")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 12")),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 30")),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_addtime").setTitle("⏱️ Adicionar Tempo").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 12")),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 30")),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_setexpiry() {
-    return new ModalBuilder().setCustomId("modal_setexpiry").setTitle("📅 Redefinir Expiração")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Novo tempo — Horas").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Novo tempo — Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_setexpiry").setTitle("📅 Redefinir Expiração").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Novo tempo — Horas").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Novo tempo — Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_extend() {
-    return new ModalBuilder().setCustomId("modal_extend").setTitle("➕ Estender Key")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_extend").setTitle("➕ Estender Key").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas a adicionar").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos a adicionar").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("0")),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_transfer() {
-    return new ModalBuilder().setCustomId("modal_transfer").setTitle("🔀 Transferir Key")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_old").setLabel("Nome atual da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_new").setLabel("Novo nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_transfer").setTitle("🔀 Transferir Key").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_old").setLabel("Nome atual da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_new").setLabel("Novo nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_sethwid() {
-    return new ModalBuilder().setCustomId("modal_sethwid").setTitle("💻 Definir HWID")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_hwid").setLabel("Novo HWID").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_sethwid").setTitle("💻 Definir HWID").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_hwid").setLabel("Novo HWID").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_lookup() {
-    return new ModalBuilder().setCustomId("modal_lookup").setTitle("🔍 Lookup Key")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_lookup").setTitle("🔍 Lookup Key").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_unblock() {
-    return new ModalBuilder().setCustomId("modal_unblock").setTitle("🔓 Desbloquear IP")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip_address").setLabel("Endereço IP").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_unblock").setTitle("🔓 Desbloquear IP").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip_address").setLabel("Endereço IP").setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 function buildModal_cleanlogs() {
-    return new ModalBuilder().setCustomId("modal_cleanlogs").setTitle("🧹 Limpar Logs")
-        .addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
-        );
+    return new ModalBuilder().setCustomId("modal_cleanlogs").setTitle("🧹 Limpar Logs").addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))
+    );
 }
 
-// ── Comandos de texto como fallback ───────────────────────────────────────────
 clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
     if (message.content === "!logspanel") { await sendLogsPanel(); return; }
     if (!message.content.startsWith("!")) return;
-    const args      = message.content.slice(1).trim().split(/ +/);
-    const cmd       = args.shift().toLowerCase();
+    const args = message.content.slice(1).trim().split(/ +/);
+    const cmd  = args.shift().toLowerCase();
     const wrongPass = (pass) => pass !== ADMIN_PASS;
-
     switch (cmd) {
         case "online": {
             const sentMsg = await message.reply({ embeds: [buildOnlineEmbed()] });
@@ -946,12 +863,12 @@ clientLogs.on("messageCreate", async (message) => {
             const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000);
             const embed  = new EmbedBuilder().setTitle("📊 Estatísticas Bob Joiner").setColor(0x5865F2)
                 .addFields(
-                    { name: "🔑 Total",    value: String(all.length),       inline: true },
-                    { name: "✅ Ativas",   value: String(active.length),    inline: true },
-                    { name: "⏸️ Pausadas", value: String(paused.length),    inline: true },
-                    { name: "♾️ Lifetime", value: String(lt.length),        inline: true },
-                    { name: "🟢 Online",   value: String(online.length),    inline: true },
-                    { name: "📡 Brainrots",value: String(brainrots.length), inline: true }
+                    { name: "🔑 Total",     value: String(all.length),       inline: true },
+                    { name: "✅ Ativas",    value: String(active.length),    inline: true },
+                    { name: "⏸️ Pausadas",  value: String(paused.length),    inline: true },
+                    { name: "♾️ Lifetime",  value: String(lt.length),        inline: true },
+                    { name: "🟢 Online",    value: String(online.length),    inline: true },
+                    { name: "📡 Brainrots", value: String(brainrots.length), inline: true }
                 ).setTimestamp();
             message.reply({ embeds: [embed] });
             break;
@@ -1000,15 +917,11 @@ clientLogs.on("messageCreate", async (message) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ─── BOT PAINEL (usuários) ────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── BOT PAINEL ───────────────────────────────────────────────────────────────
 const clientPanel = new Client({
     intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages
+        GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages
     ],
     partials: [Partials.Channel, Partials.Message]
 });
@@ -1017,8 +930,7 @@ const awaitingInput = {};
 
 function buildPanelEmbed() {
     return new EmbedBuilder()
-        .setTitle("Bob Auto Joiner")
-        .setColor(0x5865F2)
+        .setTitle("Bob Auto Joiner").setColor(0x5865F2)
         .setDescription(
             "This control panel is for the project: **Bob Joiner**\n\n" +
             "If you're a buyer, click on the buttons below to redeem your key, get the script or get your role"
@@ -1057,50 +969,33 @@ clientPanel.on("ready", async () => {
                     if (msg.author.id === clientPanel.user.id) await msg.delete().catch(() => {});
                 }
                 await ch.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() });
-                console.log("[PANEL] Painel enviado!");
             }
-        } catch (e) {
-            console.error("[PANEL] Erro ao enviar painel:", e.message);
-        }
+        } catch (e) { console.error("[PANEL] Erro ao enviar painel:", e.message); }
     }
 });
 
 clientPanel.on("messageCreate", async (message) => {
     if (message.author.bot) return;
-
     if (message.channel.type === ChannelType.DM) {
         const state = awaitingInput[message.author.id];
         if (!state) return;
-
         const key     = message.content.trim();
         const keyName = findKey(key);
-
         if (!keyName) return message.reply("❌ Key não encontrada!");
         const d = keys[keyName];
         if (d.paused) return message.reply("⏸️ Sua key está pausada.");
         if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
-
         if (state.step === "redeem_key") {
             delete awaitingInput[message.author.id];
-            const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
-            return message.reply(`✅ Key válida! Tempo restante: **${timeLeft}**`);
+            return message.reply(`✅ Key válida! Tempo restante: **${d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now())}**`);
         }
-
         if (state.step === "script_key") {
             delete awaitingInput[message.author.id];
-            return message.reply(
-                "📋 **Bob Joiner Script**\n\n" +
-                (SCRIPT_URL
-                    ? `Execute no seu executor:\n\`\`\`\nloadstring(game:HttpGet('${SCRIPT_URL}'))()\n\`\`\``
-                    : "❌ Script URL não configurada. Contate o administrador.")
-            );
+            return message.reply("📋 **Bob Joiner Script**\n\n" + (SCRIPT_URL ? `Execute no seu executor:\n\`\`\`\nloadstring(game:HttpGet('${SCRIPT_URL}'))()\n\`\`\`` : "❌ Script URL não configurada."));
         }
-
         if (state.step === "role_key") {
-            if (d.discordId && d.discordId !== message.author.id)
-                return message.reply("❌ Essa key já está vinculada a outro Discord!");
-            d.discordId = message.author.id;
-            await saveKey(keyName);
+            if (d.discordId && d.discordId !== message.author.id) return message.reply("❌ Essa key já está vinculada a outro Discord!");
+            d.discordId = message.author.id; await saveKey(keyName);
             delete awaitingInput[message.author.id];
             const ROLE_ID = process.env.BUYER_ROLE_ID;
             if (ROLE_ID && state.guildId) {
@@ -1109,49 +1004,32 @@ clientPanel.on("messageCreate", async (message) => {
                     const member = await guild.members.fetch(message.author.id);
                     await member.roles.add(ROLE_ID);
                     return message.reply(`✅ Discord vinculado à key \`${keyName}\` e cargo adicionado!`);
-                } catch (e) {
-                    console.error("[PANEL] Erro ao dar cargo:", e.message);
-                    return message.reply(`✅ Discord vinculado à key \`${keyName}\`! (Cargo não adicionado automaticamente)`);
-                }
+                } catch (e) { return message.reply(`✅ Discord vinculado à key \`${keyName}\`! (Cargo não adicionado automaticamente)`); }
             }
             return message.reply(`✅ Discord vinculado à key \`${keyName}\` com sucesso!`);
         }
-
         if (state.step === "hwid_key") {
-            keys[keyName].hwid = null;
-            kicked[keyName.toLowerCase()] = Date.now();
-            await saveKey(keyName);
+            keys[keyName].hwid = null; kicked[keyName.toLowerCase()] = Date.now(); await saveKey(keyName);
             delete awaitingInput[message.author.id];
             return message.reply("✅ HWID resetado! Já pode logar em outro dispositivo.");
         }
-
         if (state.step === "stats_key") {
             const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
-            const status   = d.paused ? "⏸️ Pausada" : "✅ Ativa";
-            const hwid     = d.hwid ? `\`${d.hwid.substring(0, 8)}...\`` : "Nenhum (Livre)";
-            const discord  = d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*";
             delete awaitingInput[message.author.id];
-            const embed = new EmbedBuilder()
-                .setTitle("📊 Key Info")
-                .setColor(0x5865F2)
+            const embed = new EmbedBuilder().setTitle("📊 Key Info").setColor(0x5865F2)
                 .addFields(
-                    { name: "🔑 Key",            value: `\`${keyName}\``, inline: true  },
-                    { name: "⏱️ Tempo Restante", value: timeLeft,         inline: true  },
-                    { name: "📌 Status",          value: status,           inline: true  },
-                    { name: "💻 HWID",            value: hwid,             inline: false },
-                    { name: "👤 Discord",          value: discord,          inline: false }
+                    { name: "🔑 Key",            value: `\`${keyName}\``,                                              inline: true  },
+                    { name: "⏱️ Tempo Restante", value: timeLeft,                                                      inline: true  },
+                    { name: "📌 Status",          value: d.paused ? "⏸️ Pausada" : "✅ Ativa",                         inline: true  },
+                    { name: "💻 HWID",            value: d.hwid ? `\`${d.hwid.substring(0, 8)}...\`` : "Livre",       inline: false },
+                    { name: "👤 Discord",          value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*",    inline: false }
                 );
             return message.reply({ embeds: [embed] });
         }
     }
-
     if (message.content === "!panel") {
-        try {
-            await message.channel.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() });
-            message.reply("✅ Painel enviado!");
-        } catch (e) {
-            message.reply("❌ Erro: " + e.message);
-        }
+        try { await message.channel.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() }); message.reply("✅ Painel enviado!"); }
+        catch (e) { message.reply("❌ Erro: " + e.message); }
     }
 });
 
@@ -1159,7 +1037,6 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton()) return;
     const user = interaction.user;
     await interaction.deferReply({ flags: 64 });
-
     switch (interaction.customId) {
         case "panel_redeem": {
             awaitingInput[user.id] = { step: "redeem_key" };
@@ -1194,11 +1071,13 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
 // ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+
 app.get("/health", (req, res) => res.json({ status: "ok", time: Date.now() }));
 app.get("/",       (req, res) => res.send("<h1>Bob API v10 — Online ✅</h1>"));
 
-// FIX 5: /validate com logs detalhados
 app.get("/validate", requireClientHeader, (req, res) => {
     const { key, secret, hwid } = req.query;
     console.log(`[VALIDATE] key="${key}" hwid="${hwid}" secret_ok=${secret === SCRIPT_SECRET} keys_mem=${Object.keys(keys).length}`);
@@ -1234,6 +1113,48 @@ app.get("/api/latest", requireClientHeader, (req, res) => {
     res.json(brainrots[brainrots.length - 1]);
 });
 
+// ════ NOVA ROTA — /api/notify (usada pelo hop script) ════
+app.post("/api/notify", requireClientHeader, (req, res) => {
+    const { key, secret, name, jobId, value, description } = req.body;
+
+    // Valida secret (sem checar hwid — o hop não tem)
+    if (!secret || secret !== SCRIPT_SECRET) {
+        console.warn(`[NOTIFY] Secret inválido: "${secret}"`);
+        return res.status(403).json({ status: "error", message: "Secret inválido." });
+    }
+
+    // Valida key
+    const keyName = findKey(key);
+    if (!keyName) {
+        console.warn(`[NOTIFY] Key não encontrada: "${key}"`);
+        return res.status(403).json({ status: "error", message: "Chave nao existe." });
+    }
+
+    const keyData = keys[keyName];
+    if (keyData.paused) return res.status(403).json({ status: "error", message: "Chave pausada." });
+    if (keyData.expiry !== Infinity && keyData.expiry - Date.now() <= 0) {
+        return res.status(403).json({ status: "error", message: "Chave expirada." });
+    }
+
+    const payload = {
+        id:          Date.now().toString(),
+        title:       name        || "Brainrot",
+        description: description || name || "Novo Brainrot!",
+        brainrot:    name        || "Brainrot",
+        name:        name        || "Brainrot",
+        jobId:       xorObfuscate(jobId) || null,
+        value:       String(value || "0"),
+        players:     "N/A"
+    };
+
+    brainrots.push(payload);
+    if (brainrots.length > 100) brainrots.shift();
+    io.emit("brainrot", payload);
+
+    console.log(`[NOTIFY] ✅ ${payload.title} | key: ${keyName} | jobId: ${jobId}`);
+    res.json({ status: "ok", id: payload.id });
+});
+
 app.get("/kicked", requireClientHeader, (req, res) => {
     const { key, secret } = req.query;
     if (secret !== SCRIPT_SECRET) return res.json({ kicked: false });
@@ -1255,7 +1176,6 @@ app.post("/presence", requireClientHeader, async (req, res) => {
         const cleanId = String(discordId).replace(/\D/g, "");
         if (cleanId.length >= 17 && cleanId.length <= 20) {
             if (!d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); }
-            else if (d.discordId !== cleanId) console.warn(`[PRESENCE] Key ${r.keyName} já vinculada ao Discord ${d.discordId}`);
         }
     }
     res.json({ status: "ok" });
@@ -1315,8 +1235,7 @@ app.post("/link-discord", requireClientHeader, async (req, res) => {
     const d = keys[r.keyName];
     if (d.discordId && d.discordId !== cleanId)
         return res.status(409).json({ status: "error", message: "Key ja vinculada a outro Discord ID." });
-    d.discordId = cleanId;
-    await saveKey(r.keyName);
+    d.discordId = cleanId; await saveKey(r.keyName);
     res.json({ status: "ok", message: "Discord vinculado!" });
 });
 
@@ -1334,7 +1253,7 @@ if (DISCORD_TOKEN_NOTIFIER) {
     clientNotifier.login(DISCORD_TOKEN_NOTIFIER)
         .then(() => console.log("[NOTIFIER] Login OK"))
         .catch(e => console.error("[NOTIFIER] Erro login:", e.message));
-} else console.warn("[NOTIFIER] Token ausente — Bob Notifier desativado.");
+} else console.warn("[NOTIFIER] Token ausente.");
 
 if (DISCORD_TOKEN_LOGS) {
     clientLogs.login(DISCORD_TOKEN_LOGS)
