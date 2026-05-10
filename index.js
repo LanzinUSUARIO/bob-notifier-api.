@@ -91,7 +91,7 @@ async function saveKey(name) {
         const raw = { ...keys[name] };
         if (raw.expiry    === Infinity) raw.expiry    = LIFETIME_VALUE;
         if (raw.remaining === Infinity) raw.remaining = LIFETIME_VALUE;
-        await KeyModel.findOneAndUpdate({ name }, { name, ...raw }, { upsert: true, new: true });
+        await KeyModel.findOneAndUpdate({ name }, { name, ...raw }, { upsert: true, returnDocument: "after" });
     } catch (e) {
         console.error("[DB] Erro ao salvar key:", e.message);
     }
@@ -135,7 +135,7 @@ const CLIENT_HEADER          = process.env.CLIENT_HEADER || "BobJoiner-v2";
 const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
 const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL;
-const DISCORD_TOKEN_PAYMENT  = process.env.DISCORD_TOKEN_PAYMENT; // token do bot de pagamento
+const DISCORD_TOKEN_PAYMENT  = process.env.DISCORD_TOKEN_PAYMENT;
 const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
 const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "1502373185125875873";
 const LOGS_CHANNEL_ID        = process.env.LOGS_CHANNEL_ID    || "";
@@ -223,7 +223,7 @@ const formatTime = (ms) => {
     return p.join(" ");
 };
 
-const findKey   = (name) => Object.keys(keys).find(k => k.toLowerCase() === (name || "").trim().toLowerCase());
+const findKey    = (name) => Object.keys(keys).find(k => k.toLowerCase() === (name || "").trim().toLowerCase());
 const tsRelative = (date) => `<t:${Math.floor(new Date(date).getTime() / 1000)}:R>`;
 
 const checkKey = (key, secret, hwid) => {
@@ -261,7 +261,7 @@ function generateBobKey() {
     return r;
 }
 
-// ─── CONFIRMAR PAGAMENTO (cria key e avisa usuário) ──────────────────────────
+// ─── CONFIRMAR PAGAMENTO ──────────────────────────────────────────────────────
 async function confirmarPagamento(user, hours, channel) {
     const keyName   = generateBobKey();
     const expiresAt = Date.now() + hours * 3600000;
@@ -306,7 +306,7 @@ const clientNotifier = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildWebhooks]
 });
 
-clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
+clientNotifier.on("clientReady", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 
 clientNotifier.on("messageCreate", async (message) => {
     if (message.author.bot && message.author.id === clientNotifier.user?.id) return;
@@ -340,7 +340,7 @@ const clientLogs = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-clientLogs.on("ready", async () => {
+clientLogs.on("clientReady", async () => {
     console.log(`[LOGS] Online: ${clientLogs.user.tag}`);
     await sendLogsPanel();
 });
@@ -392,7 +392,6 @@ function buildLogsRows() {
             new ButtonBuilder().setCustomId("logs_cleanlogs").setLabel("Limpar Logs").setEmoji("🧹").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("logs_test").setLabel("Teste").setEmoji("🧪").setStyle(ButtonStyle.Secondary),
         ),
-        // ── NOVA LINHA: PAGAMENTOS ──
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("logs_pendentes").setLabel("Pendentes Pix").setEmoji("⏳").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("logs_confirmar_manual").setLabel("Confirmar Pagamento").setEmoji("💳").setStyle(ButtonStyle.Success),
@@ -437,7 +436,7 @@ function buildOnlineEmbed() {
     }
     const userList = Object.entries(userMap);
     const embed = new EmbedBuilder().setTitle("🟢 Usuários Online no Script").setColor(0x00C853)
-        .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online • Atualiza a cada 5s` }).setTimestamp();
+        .setFooter({ text: `Bob Joiner • ${userList.length} usuário(s) online` }).setTimestamp();
     if (!userList.length) {
         embed.setDescription("Nenhum usuário online no momento.");
     } else {
@@ -456,7 +455,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.customId.startsWith("logs_")) return;
     const id = interaction.customId;
 
-    // ── ONLINE ──
     if (id === "logs_online") {
         await interaction.deferReply({ ephemeral: false });
         const sentMsg = await interaction.editReply({ embeds: [buildOnlineEmbed()] });
@@ -479,8 +477,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         } else await interaction.editReply({ content: "Nenhuma atualização ativa neste canal." });
         return;
     }
-
-    // ── STATS ──
     if (id === "logs_stats") {
         await interaction.deferReply({ ephemeral: true });
         const all    = Object.values(keys);
@@ -499,8 +495,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
             ).setTimestamp()] });
         return;
     }
-
-    // ── LISTAR KEYS ──
     if (id === "logs_info") {
         await interaction.deferReply({ ephemeral: true });
         const ks = Object.keys(keys);
@@ -514,8 +508,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
             .setDescription(lines.join("\n").substring(0, 4000)).setTimestamp()] });
         return;
     }
-
-    // ── JOBIDS ──
     if (id === "logs_jobids") {
         await interaction.deferReply({ ephemeral: true });
         const entries = Object.entries(userJobIds);
@@ -523,8 +515,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ content: "🎮 **JobIDs conhecidos:**\n" + entries.map(([n, j]) => `• **${n}**: \`${j}\``).join("\n") });
         return;
     }
-
-    // ── BLOCKED ──
     if (id === "logs_blocked") {
         await interaction.deferReply({ ephemeral: true });
         const now    = Date.now();
@@ -533,17 +523,13 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ content: "🔒 **IPs Bloqueados:**\n" + active.map(([ip, until]) => `• \`${ip}\` — ainda ${Math.ceil((until - now) / 1000)}s`).join("\n") });
         return;
     }
-
-    // ── TESTE ──
     if (id === "logs_test") {
         await interaction.deferReply({ ephemeral: true });
         const payload = { id: Date.now().toString(), title: "TESTE", description: "SINAL OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A" };
         brainrots.push(payload); io.emit("brainrot", payload);
-        await interaction.editReply({ content: "✅ Brainrot de teste enviado!" });
+        await interaction.editReply({ content: "✅ Brainrot de teste enviado para todos!" });
         return;
     }
-
-    // ── PENDENTES PIX ──
     if (id === "logs_pendentes") {
         await interaction.deferReply({ ephemeral: true });
         const pendentes = await PendingPayment.find().sort({ createdAt: -1 });
@@ -563,8 +549,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xffaa00).setTitle(`⏳ Pedidos Pendentes (${pendentes.length})`).setDescription(list)], components: rows });
         return;
     }
-
-    // ── CONFIRMAR PAGAMENTO MANUAL ──
     if (id === "logs_confirmar_manual") {
         await interaction.showModal(new ModalBuilder().setCustomId("modal_pay_confirm").setTitle("Confirmar Pagamento Manual").addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user_id").setLabel("ID do usuário Discord:").setStyle(TextInputStyle.Short).setPlaceholder("123456789012345678").setRequired(true)),
@@ -572,8 +556,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         ));
         return;
     }
-
-    // ── VENDAS ──
     if (id === "logs_vendas") {
         await interaction.deferReply({ ephemeral: true });
         const allKeys   = Object.values(keys);
@@ -589,8 +571,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         ).setTimestamp()] });
         return;
     }
-
-    // ── CONFIRMAR via botão rápido ──
     if (id.startsWith("pay_confirm_")) {
         const parts    = id.split("_");
         const targetId = parts[2];
@@ -602,8 +582,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: `✅ Key confirmada para **${target.tag}** (${hours}h)!`, ephemeral: true });
         return;
     }
-
-    // ── MODAIS DOS BOTÕES DE KEYS ──
     const modalMap = {
         logs_create: buildModal_create, logs_lifetime: buildModal_lifetime,
         logs_revoke: buildModal_revoke, logs_pause: buildModal_pause,
@@ -622,7 +600,6 @@ async function handleLogsModal(interaction) {
     const getField = (name) => { try { return interaction.fields.getTextInputValue(name); } catch { return ""; } };
     const wrongPass = (pass) => pass !== ADMIN_PASS;
 
-    // ── CONFIRMAR PAGAMENTO MANUAL ──
     if (id === "modal_pay_confirm") {
         const userId = getField("user_id").trim();
         const hours  = parseInt(getField("horas").trim());
@@ -634,7 +611,6 @@ async function handleLogsModal(interaction) {
         await interaction.editReply({ content: `✅ Key gerada para **${target.tag}** (${hours}h)!` });
         return;
     }
-
     if (id === "modal_create") {
         const name = getField("key_name").trim(), h = parseInt(getField("key_h")) || 0, m = parseInt(getField("key_m")) || 0, pass = getField("key_pass");
         if (wrongPass(pass)) { await interaction.editReply({ content: "❌ Senha incorreta!" }); return; }
@@ -761,10 +737,10 @@ async function handleLogsModal(interaction) {
         const timeLeft = d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now());
         await interaction.editReply({ embeds: [new EmbedBuilder().setTitle(`🔍 Info: ${t}`).setColor(d.paused ? 0xFFA000 : 0x00C853)
             .addFields(
-                { name: "⏱️ Tempo Restante", value: timeLeft,                                                          inline: true },
-                { name: "📌 Status",          value: d.paused ? "⏸️ Pausada" : "✅ Ativa",                            inline: true },
-                { name: "💻 HWID",            value: d.hwid ? `\`${d.hwid.substring(0, 12)}...\`` : "Livre",         inline: false },
-                { name: "👤 Discord",          value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*",        inline: true }
+                { name: "⏱️ Tempo Restante", value: timeLeft,                                                       inline: true },
+                { name: "📌 Status",          value: d.paused ? "⏸️ Pausada" : "✅ Ativa",                         inline: true },
+                { name: "💻 HWID",            value: d.hwid ? `\`${d.hwid.substring(0, 12)}...\`` : "Livre",      inline: false },
+                { name: "👤 Discord",          value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*",     inline: true }
             ).setTimestamp()] });
         return;
     }
@@ -784,7 +760,6 @@ async function handleLogsModal(interaction) {
     }
 }
 
-// ── MODAL BUILDERS ──
 function buildModal_create() { return new ModalBuilder().setCustomId("modal_create").setTitle("🔑 Criar Key").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_h").setLabel("Horas").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Ex: 24")),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_m").setLabel("Minutos").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Ex: 0")),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))); }
 function buildModal_lifetime() { return new ModalBuilder().setCustomId("modal_lifetime").setTitle("♾️ Criar Key Lifetime").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key").setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))); }
 function buildModal_revoke() { return new ModalBuilder().setCustomId("modal_revoke").setTitle("🗑️ Revogar Key").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_name").setLabel("Nome da key (ou 'all' para todas)").setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("key_pass").setLabel("Senha de admin").setStyle(TextInputStyle.Short).setRequired(true))); }
@@ -819,7 +794,7 @@ clientLogs.on("messageCreate", async (message) => {
         case "stoponline": { if (global.onlineIntervals?.[message.channel.id]) { clearInterval(global.onlineIntervals[message.channel.id]); delete global.onlineIntervals[message.channel.id]; message.reply("⏹️ Parado."); } else message.reply("Nenhuma atualização ativa."); break; }
         case "blocked": { const now = Date.now(); const active = Object.entries(blockedIPs).filter(([, u]) => now < u); if (!active.length) { message.reply("Nenhum IP bloqueado."); break; } message.reply("🔒 **IPs Bloqueados:**\n" + active.map(([ip, u]) => `• \`${ip}\` — ${Math.ceil((u - now) / 1000)}s`).join("\n")); break; }
         case "unblock": { const [ip, pass] = args; if (wrongPass(pass)) { message.reply("❌ Senha incorreta!"); break; } if (blockedIPs[ip]) { delete blockedIPs[ip]; message.reply(`✅ IP \`${ip}\` desbloqueado.`); } else message.reply("IP não estava bloqueado."); break; }
-        case "test": { const p = { id: Date.now().toString(), title: "TESTE", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A" }; brainrots.push(p); io.emit("brainrot", p); message.reply("✅ Teste enviado!"); break; }
+        case "test": { const p = { id: Date.now().toString(), title: "TESTE", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A" }; brainrots.push(p); io.emit("brainrot", p); message.reply("✅ Teste enviado para todos!"); break; }
         case "stats": { const all = Object.values(keys); const active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)); const paused = all.filter(k => k.paused); const lt = all.filter(k => k.expiry === Infinity); const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < 30000); message.reply({ embeds: [new EmbedBuilder().setTitle("📊 Estatísticas").setColor(0x5865F2).addFields({ name: "🔑 Total", value: String(all.length), inline: true },{ name: "✅ Ativas", value: String(active.length), inline: true },{ name: "⏸️ Pausadas", value: String(paused.length), inline: true },{ name: "♾️ Lifetime", value: String(lt.length), inline: true },{ name: "🟢 Online", value: String(online.length), inline: true },{ name: "📡 Brainrots", value: String(brainrots.length), inline: true }).setTimestamp()] }); break; }
     }
 });
@@ -861,7 +836,7 @@ function buildPanelRows() {
     ];
 }
 
-clientPanel.on("ready", async () => {
+clientPanel.on("clientReady", async () => {
     console.log(`[PANEL] Online: ${clientPanel.user.tag}`);
     if (PANEL_CHANNEL_ID) {
         try {
@@ -926,7 +901,7 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ─── BOT PAGAMENTO (buy-here) ────────────────────────────────────────────
+// ─── BOT PAGAMENTO ───────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 const clientPayment = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
@@ -952,7 +927,7 @@ function buildShopRows() {
     return [row];
 }
 
-clientPayment.on("ready", async () => {
+clientPayment.on("clientReady", async () => {
     console.log(`[PAYMENT] Online: ${clientPayment.user.tag}`);
     try {
         const ch = await clientPayment.channels.fetch(BUY_CHANNEL);
@@ -970,18 +945,15 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
     const id   = interaction.customId;
     const user = interaction.user;
 
-    // ── COMPRAR PLANO ──
     if (id.startsWith("buy_") && id !== "buy_minhakey") {
         const planValue = id.replace("buy_", "");
         const plan      = PLANS.find(p => p.value === planValue);
         if (!plan) return interaction.reply({ content: "❌ Plano inválido!", ephemeral: true });
-
         await PendingPayment.findOneAndUpdate(
             { discordId: user.id },
             { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, label: plan.label },
-            { upsert: true, new: true }
+            { upsert: true, returnDocument: "after" }
         );
-
         return interaction.reply({ embeds: [new EmbedBuilder()
             .setColor(0x00ccff)
             .setTitle("💳 Dados para Pagamento Pix")
@@ -995,7 +967,6 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
             .setTimestamp()], ephemeral: true });
     }
 
-    // ── MINHA KEY ──
     if (id === "buy_minhakey") {
         const userKeys = Object.entries(keys).filter(([, d]) => d.discordId === user.id);
         if (!userKeys.length) return interaction.reply({ content: "❌ Nenhuma key ativa! Use a loja para comprar.", ephemeral: true });
@@ -1043,17 +1014,34 @@ app.get("/get-brainrots", requireClientHeader, (req, res) => {
 app.get("/logs",       requireClientHeader, (req, res) => { const { key, secret, hwid } = req.query; const r = checkKey(key, secret, hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); res.json(brainrots); });
 app.get("/api/latest", requireClientHeader, (req, res) => { const { key, secret, hwid } = req.query; const r = checkKey(key, secret, hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); if (!brainrots.length) return res.json({ status: "waiting" }); res.json(brainrots[brainrots.length - 1]); });
 
+// ════════════════════════════════════════════════════════════════
+// ─── /api/notify — RECEBE DO NOTIFIER E ENVIA PRA TODOS ────────
+// ════════════════════════════════════════════════════════════════
 app.post("/api/notify", requireClientHeader, (req, res) => {
-    const { key, secret, name, jobId, value, description } = req.body;
-    if (!secret || secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido." });
-    const keyName = findKey(key);
-    if (!keyName) return res.status(403).json({ status: "error", message: "Chave nao existe." });
-    const keyData = keys[keyName];
-    if (keyData.paused) return res.status(403).json({ status: "error", message: "Chave pausada." });
-    if (keyData.expiry !== Infinity && keyData.expiry - Date.now() <= 0) return res.status(403).json({ status: "error", message: "Chave expirada." });
-    const payload = { id: Date.now().toString(), title: name || "Brainrot", description: description || name || "Novo Brainrot!", brainrot: name || "Brainrot", name: name || "Brainrot", jobId: xorObfuscate(jobId) || null, value: String(value || "0"), players: "N/A" };
-    brainrots.push(payload); if (brainrots.length > 100) brainrots.shift(); io.emit("brainrot", payload);
-    console.log(`[NOTIFY] ✅ ${payload.title} | key: ${keyName}`);
+    const { secret, name, jobId, value, description } = req.body;
+
+    // Só valida o secret — sem precisar de key
+    if (!secret || secret !== SCRIPT_SECRET)
+        return res.status(403).json({ status: "error", message: "Secret inválido." });
+
+    const payload = {
+        id:          Date.now().toString(),
+        title:       name || "Brainrot",
+        description: description || name || "Novo Brainrot!",
+        brainrot:    name || "Brainrot",
+        name:        name || "Brainrot",
+        jobId:       xorObfuscate(jobId) || null,
+        value:       String(value || "0"),
+        players:     "N/A"
+    };
+
+    brainrots.push(payload);
+    if (brainrots.length > 100) brainrots.shift();
+
+    // ✅ Emite para TODOS os usuários com AutoJoin aberto
+    io.emit("brainrot", payload);
+
+    console.log(`[NOTIFY] ✅ ${payload.title} → todos os usuários ativos`);
     res.json({ status: "ok", id: payload.id });
 });
 
@@ -1071,14 +1059,14 @@ app.post("/presence", requireClientHeader, async (req, res) => {
 
 app.get("/presence",  requireClientHeader, (req, res) => { const { key, secret, hwid } = req.query; const r = checkKey(key, secret, hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); const now = Date.now(); const active = {}; for (const [sid, info] of Object.entries(presence)) { if (now - info.lastSeen < 30000) active[info.name] = true; else delete presence[sid]; } res.json(Object.keys(active).sort()); });
 app.get("/clients",   (req, res) => res.send(`Socket.IO: ${io.sockets.sockets.size} | Presença: ${Object.keys(presence).length}`));
-app.get("/test-emit", (req, res) => { if (req.query.secret !== SCRIPT_SECRET) return res.status(403).send("Secret invalido"); const p = { id: Date.now().toString(), title: "TESTE MANUAL", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "0" }; brainrots.push(p); io.emit("brainrot", p); res.send("✅ Emit enviado!"); });
+app.get("/test-emit", (req, res) => { if (req.query.secret !== SCRIPT_SECRET) return res.status(403).send("Secret invalido"); const p = { id: Date.now().toString(), title: "TESTE MANUAL", description: "OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "0" }; brainrots.push(p); io.emit("brainrot", p); res.send("✅ Emit enviado para todos!"); });
 
 app.post("/push-brainrot", requireClientHeader, (req, res) => {
     const { secret, title, description, jobId, value, players } = req.body;
     if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido" });
     const payload = { id: Date.now().toString(), title: title || "Brainrot", description: description || "", brainrot: title || "Brainrot", name: title || "Brainrot", jobId: xorObfuscate(jobId) || null, value: value || "0", players: players || "N/A" };
     brainrots.push(payload); if (brainrots.length > 100) brainrots.shift(); io.emit("brainrot", payload);
-    console.log(`[PUSH] ✅ ${payload.title}`); res.json({ status: "ok", id: payload.id });
+    console.log(`[PUSH] ✅ ${payload.title} → todos`); res.json({ status: "ok", id: payload.id });
 });
 
 app.post("/link-discord", requireClientHeader, async (req, res) => {
