@@ -262,18 +262,54 @@ function generateBobKey() {
 async function confirmarPagamento(user, hours, channel) {
     const keyName   = generateBobKey();
     const expiresAt = Date.now() + hours * 3600000;
-    keys[keyName] = { expiry: expiresAt, paused: false, remaining: hours * 3600000, hwid: null, discordId: user.id };
+
+    // Sempre seta o discordId do comprador na key gerada
+    keys[keyName] = {
+        expiry:    expiresAt,
+        paused:    false,
+        remaining: hours * 3600000,
+        hwid:      null,
+        discordId: String(user.id)
+    };
     await saveKey(keyName);
-    const dmEmbed = new EmbedBuilder().setColor(0x00ff88).setTitle("🎉 Pagamento Confirmado!")
-        .setDescription(`Sua key foi gerada com sucesso!\n\n**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${hours}h\n**Expira:** ${tsRelative(expiresAt)}\n\nUse essa key para ativar o Bob Joiner!`)
-        .setFooter({ text: "Bob Keys • Obrigado pela compra! 🚀" }).setTimestamp();
-    try { await user.send({ embeds: [dmEmbed] }); }
-    catch { if (channel) channel.send(`⚠️ ${user} — Não consegui enviar DM! Ativa DMs do servidor. Sua key: \`${keyName}\``); }
-    if (channel) {
-        channel.send({ embeds: [new EmbedBuilder().setColor(0x00ff88).setTitle("✅ Key Gerada")
-            .setDescription(`**Usuário:** ${user.tag}\n**Plano:** ${hours}h\n**Key:** \`${keyName}\`\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] });
+
+    const dmEmbed = new EmbedBuilder()
+        .setColor(0x00ff88)
+        .setTitle("🎉 Pagamento Confirmado!")
+        .setDescription(
+            `Sua key foi gerada com sucesso!\n\n` +
+            `**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n` +
+            `**Plano:** ${hours}h\n` +
+            `**Expira:** ${tsRelative(expiresAt)}\n\n` +
+            `Use essa key para ativar o Bob Joiner!`
+        )
+        .setFooter({ text: "Bob Keys • Obrigado pela compra! 🚀" })
+        .setTimestamp();
+
+    // Tenta enviar DM — se falhar avisa no canal
+    let dmOk = false;
+    try { await user.send({ embeds: [dmEmbed] }); dmOk = true; } catch {}
+
+    if (!dmOk && channel) {
+        channel.send(`⚠️ <@${user.id}> — Não consegui enviar DM! Ativa DMs do servidor.\nSua key: \`${keyName}\``).catch(() => {});
     }
-    console.log(`[PAYMENT] ✅ Key gerada para ${user.tag}: ${keyName} (${hours}h)`);
+
+    if (channel) {
+        channel.send({ embeds: [new EmbedBuilder()
+            .setColor(0x00ff88)
+            .setTitle("✅ Key Gerada")
+            .setDescription(
+                `**Usuário:** <@${user.id}> (${user.tag})\n` +
+                `**Plano:** ${hours}h\n` +
+                `**Key:** \`${keyName}\`\n` +
+                `**Expira:** ${tsRelative(expiresAt)}\n` +
+                `**DM enviada:** ${dmOk ? "✅ Sim" : "❌ Não (DMs fechadas)"}`
+            )
+            .setTimestamp()]
+        }).catch(() => {});
+    }
+
+    console.log(`[PAYMENT] ✅ Key gerada para ${user.tag} (${user.id}): ${keyName} (${hours}h) | DM: ${dmOk}`);
 }
 
 // ─── SOCKET.IO — AUTENTICAÇÃO ANTES DA CONEXÃO ────────────────────────────────
@@ -586,14 +622,19 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id.startsWith("pay_confirm_")) {
+        await interaction.deferReply({ ephemeral: true });
         const parts    = id.split("_");
         const targetId = parts[2];
         const hours    = parseInt(parts[3]);
-        const target   = await clientLogs.users.fetch(targetId).catch(() => null);
-        if (!target) { await interaction.reply({ content: "❌ Usuário não encontrado!", ephemeral: true }); return; }
+        // Tenta buscar o usuário em todos os clientes disponíveis como fallback
+        let target = null;
+        for (const client of [clientLogs, clientPayment, clientPanel, clientNotifier]) {
+            try { target = await client.users.fetch(targetId); if (target) break; } catch {}
+        }
+        if (!target) { await interaction.editReply({ content: "❌ Usuário não encontrado!" }); return; }
         await confirmarPagamento(target, hours, interaction.channel);
         await PendingPayment.deleteOne({ discordId: targetId });
-        await interaction.reply({ content: `✅ Key confirmada para **${target.tag}** (${hours}h)!`, ephemeral: true });
+        await interaction.editReply({ content: `✅ Key gerada e enviada na DM de **${target.tag}** (${hours}h)!` });
         return;
     }
     const modalMap = {
