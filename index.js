@@ -503,7 +503,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
                  || member?.roles?.cache?.has("1501356382677373101")
                  || member?.roles?.cache?.has("1477885797553148066");
     if (!hasRole) {
-        await interaction.reply({ content: "❌ Você não tem permissão para usar este painel.", ephemeral: true });
+        await interaction.reply({ content: "❌ Você não tem permissão para usar este painel.", flags: 64 });
         return;
     }
 
@@ -523,7 +523,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id === "logs_stoponline") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         if (global.onlineIntervals?.[interaction.channelId]) {
             clearInterval(global.onlineIntervals[interaction.channelId]);
             delete global.onlineIntervals[interaction.channelId];
@@ -532,7 +532,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id === "logs_stats") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const all    = Object.values(keys);
         const active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0));
         const paused = all.filter(k => k.paused);
@@ -550,7 +550,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id === "logs_info") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const ks = Object.keys(keys);
         if (!ks.length) { await interaction.editReply({ content: "Nenhuma chave ativa." }); return; }
         const lines = ks.map(k => {
@@ -562,14 +562,14 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id === "logs_jobids") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const entries = Object.entries(userJobIds);
         if (!entries.length) { await interaction.editReply({ content: "Nenhum JobID registrado." }); return; }
         await interaction.editReply({ content: "🎮 **JobIDs conhecidos:**\n" + entries.map(([n, j]) => `• **${n}**: \`${j}\``).join("\n") });
         return;
     }
     if (id === "logs_blocked") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const now    = Date.now();
         const active = Object.entries(blockedIPs).filter(([, until]) => now < until);
         if (!active.length) { await interaction.editReply({ content: "Nenhum IP bloqueado no momento." }); return; }
@@ -577,14 +577,14 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id === "logs_test") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const payload = { id: Date.now().toString(), title: "TESTE", description: "SINAL OK!", brainrot: "TESTE", name: "TESTE", jobId: null, value: "999999999", players: "N/A" };
         brainrots.push(payload); io.emit("brainrot", payload);
         await interaction.editReply({ content: "✅ Brainrot de teste enviado!" });
         return;
     }
     if (id === "logs_pendentes") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const pendentes = await PendingPayment.find().sort({ createdAt: -1 });
         if (!pendentes.length) { await interaction.editReply({ content: "✅ Nenhum pedido pendente!" }); return; }
         const list = pendentes.map(p => `• **${p.discordTag}** — ${p.label} (R$${p.price}) — ${tsRelative(p.createdAt)}`).join("\n");
@@ -607,7 +607,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id === "logs_vendas") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const allKeys   = Object.values(keys);
         const por2h     = allKeys.filter(k => k.remaining <= 7200000 && k.remaining > 0).length;
         const por4h     = allKeys.filter(k => k.remaining > 7200000).length;
@@ -622,7 +622,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
     if (id.startsWith("pay_confirm_")) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: 64 });
         const parts    = id.split("_");
         const targetId = parts[2];
         const hours    = parseInt(parts[3]);
@@ -650,7 +650,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
 });
 
 async function handleLogsModal(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: 64 });
     const id       = interaction.customId;
     const getField = (name) => { try { return interaction.fields.getTextInputValue(name); } catch { return ""; } };
     const wrongPass = (pass) => pass !== ADMIN_PASS;
@@ -988,7 +988,7 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
     const id = interaction.customId, user = interaction.user;
     if (id.startsWith("buy_") && id !== "buy_minhakey") {
         const plan = PLANS.find(p => p.value === id.replace("buy_", ""));
-        if (!plan) return interaction.reply({ content: "❌ Plano inválido!", ephemeral: true });
+        if (!plan) return interaction.reply({ content: "❌ Plano inválido!", flags: 64 });
         await PendingPayment.findOneAndUpdate(
             { discordId: user.id },
             { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, label: plan.label },
@@ -996,14 +996,14 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
         );
         return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ccff).setTitle("💳 Dados para Pagamento Pix")
             .setDescription(`**Plano:** ${plan.emoji} ${plan.label}\n**Valor:** R$${plan.price},00\n\n**🔑 Chave Pix:**\n\`\`\`${PIX_KEY}\`\`\`\n**Nome:** ${PIX_NAME}\n\n> ✅ Após pagar, mande o **comprovante** aqui no canal!\n> Um admin confirma e a key chega no seu privado.`)
-            .setFooter({ text: `Pedido registrado • ${user.tag}` }).setTimestamp()], ephemeral: true });
+            .setFooter({ text: `Pedido registrado • ${user.tag}` }).setTimestamp()], flags: 64 });
     }
     if (id === "buy_minhakey") {
         const userKeys = Object.entries(keys).filter(([, d]) => d.discordId === user.id);
-        if (!userKeys.length) return interaction.reply({ content: "❌ Nenhuma key ativa! Use a loja para comprar.", ephemeral: true });
+        if (!userKeys.length) return interaction.reply({ content: "❌ Nenhuma key ativa! Use a loja para comprar.", flags: 64 });
         const now  = Date.now();
         const list = userKeys.map(([k, d]) => { const rem = d.expiry === Infinity ? "Lifetime ♾️" : (d.expiry - now > 0 ? formatTime(d.expiry - now) : "❌ Expirada"); return `\`${k}\` — ⏳ ${rem}`; }).join("\n");
-        return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff88).setTitle("🔑 Suas Keys").setDescription(list).setFooter({ text: user.tag })], ephemeral: true });
+        return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff88).setTitle("🔑 Suas Keys").setDescription(list).setFooter({ text: user.tag })], flags: 64 });
     }
 });
 
