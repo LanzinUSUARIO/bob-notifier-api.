@@ -496,7 +496,7 @@ function buildOnlineEmbed() {
 clientLogs.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isModalSubmit()) { await handleLogsModal(interaction); return; }
     if (!interaction.isButton()) return;
-    if (!interaction.customId.startsWith("logs_")) return;
+    if (!interaction.customId.startsWith("logs_") && !interaction.customId.startsWith("pay_confirm_")) return;
 
     const member  = interaction.member;
     const hasRole = member?.roles?.cache?.has("1477885793144930496")
