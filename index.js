@@ -10,7 +10,22 @@ const {
 } = require("discord.js");
 const mongoose = require("mongoose");
 
-const XOR_KEY = "AnarcoLinduKey2026Seilasoubonitoegostosohahahha";
+// ─── REQUIRE ENV (falha se não definido — nunca deixa valor padrão exposto) ───
+function requireEnv(name) {
+    const val = process.env[name];
+    if (!val) {
+        console.error(`[FATAL] Variável obrigatória não definida: ${name}`);
+        process.exit(1);
+    }
+    return val;
+}
+
+const ADMIN_PASS    = requireEnv("ADMIN_PASS");
+const SCRIPT_SECRET = requireEnv("SCRIPT_SECRET");
+const CLIENT_HEADER = process.env.CLIENT_HEADER || "BobJoiner-v2";
+
+// ─── XOR OBFUSCATION ─────────────────────────────────────────────────────────
+const XOR_KEY = requireEnv("XOR_KEY");
 function xorObfuscate(value) {
     if (!value) return value;
     const str = String(value);
@@ -22,9 +37,9 @@ function xorObfuscate(value) {
 
 const LIFETIME_VALUE = 9999999999999;
 
-const PIX_KEY     = process.env.PIX_KEY     || "joaojanela2009@gmail.com";
-const PIX_NAME    = process.env.PIX_NAME    || "João";
-const BUY_CHANNEL = process.env.BUY_CHANNEL || "1503090485143666828";
+const PIX_KEY     = process.env.PIX_KEY     || "";
+const PIX_NAME    = process.env.PIX_NAME    || "";
+const BUY_CHANNEL = process.env.BUY_CHANNEL || "";
 const PLANS = [
     { label: "1 Hora",  value: "1h", price: 5,  hours: 1, emoji: "🕐" },
     { label: "2 Horas", value: "2h", price: 10, hours: 2, emoji: "⏱️" },
@@ -32,14 +47,10 @@ const PLANS = [
 ];
 
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
-const MONGODB_URI = process.env.MONGODB_URI;
-if (MONGODB_URI) {
-    mongoose.connect(MONGODB_URI)
-        .then(() => console.log("[DB] MongoDB conectado!"))
-        .catch(e => console.error("[DB] Erro:", e.message));
-} else {
-    console.warn("[DB] MONGODB_URI não definido!");
-}
+const MONGODB_URI = requireEnv("MONGODB_URI");
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log("[DB] MongoDB conectado!"))
+    .catch(e => { console.error("[DB] Erro fatal:", e.message); process.exit(1); });
 
 const KeySchema = new mongoose.Schema({
     name:      { type: String, required: true, unique: true },
@@ -113,15 +124,12 @@ const io     = new Server(server, {
 const port = process.env.PORT || 3000;
 
 // ─── ENV VARS ─────────────────────────────────────────────────────────────────
-const ADMIN_PASS             = process.env.ADMIN_PASS    || "ADMIN_PADRAO_MUDE_NO_RENDER";
-const SCRIPT_SECRET          = process.env.SCRIPT_SECRET || "BOB_SECURE_2024_XYZ";
-const CLIENT_HEADER          = process.env.CLIENT_HEADER || "BobJoiner-v2";
 const DISCORD_TOKEN_NOTIFIER = process.env.DISCORD_TOKEN_NOTIFIER;
 const DISCORD_TOKEN_LOGS     = process.env.DISCORD_TOKEN_LOGS;
 const DISCORD_TOKEN_PANEL    = process.env.DISCORD_TOKEN_PANEL;
 const DISCORD_TOKEN_PAYMENT  = process.env.DISCORD_TOKEN_PAYMENT;
-const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "1494529159484149801";
-const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "1502373185125875873";
+const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID || "";
+const PANEL_CHANNEL_ID       = process.env.PANEL_CHANNEL_ID   || "";
 const LOGS_CHANNEL_ID        = process.env.LOGS_CHANNEL_ID    || "";
 const BOB_LOGS_PANEL_CHANNEL = process.env.BOB_LOGS_PANEL_CHANNEL || "";
 const SCRIPT_URL             = process.env.SCRIPT_URL         || "";
@@ -141,6 +149,13 @@ const RATE_LIMIT_WINDOW = 60000;
 const BLOCK_DURATION    = 300000;
 const rateLimitMap      = {};
 const blockedIPs        = {};
+
+// Ferramentas de spy/análise bloqueadas por User-Agent
+const BLOCKED_UA = [
+    "python-requests", "python-httpx", "curl", "wget", "httpie",
+    "insomnia", "postman", "go-http-client", "java/", "axios",
+    "okhttp", "libwww-perl", "scrapy", "aiohttp"
+];
 
 function getRealIP(req) {
     return (req.headers["x-forwarded-for"] || "").split(",")[0].trim()
@@ -171,7 +186,7 @@ function rateLimitMiddleware(req, res, next) {
     rateLimitMap[ip].count++;
     if (rateLimitMap[ip].count > RATE_LIMIT_MAX) {
         blockedIPs[ip] = now + BLOCK_DURATION;
-        console.warn(`[SECURITY] IP bloqueado: ${ip}`);
+        console.warn(`[SECURITY] IP bloqueado por rate limit: ${ip}`);
         logSecurityAlert(`🔴 IP \`${ip}\` bloqueado por rate limit`);
         return res.status(429).json({ status: "error", message: "Muitas requisições. IP bloqueado por 5 minutos." });
     }
@@ -180,12 +195,24 @@ function rateLimitMiddleware(req, res, next) {
 
 function requireClientHeader(req, res, next) {
     const header = req.headers["x-bob-client"];
+    const ua     = (req.headers["user-agent"] || "").toLowerCase();
+    const ip     = getRealIP(req);
+
+    // Bloqueia header inválido
     if (!header || header !== CLIENT_HEADER) {
-        const ip = getRealIP(req);
         console.warn(`[SECURITY] Header inválido de ${ip}: "${header}" em ${req.path}`);
         logSecurityAlert(`⚠️ Acesso sem header válido de \`${ip}\` em \`${req.path}\``);
         return res.status(403).json({ status: "error", message: "Acesso negado." });
     }
+
+    // Bloqueia ferramentas de spy por User-Agent
+    if (BLOCKED_UA.some(b => ua.includes(b))) {
+        blockedIPs[ip] = Date.now() + BLOCK_DURATION;
+        console.warn(`[SECURITY] Ferramenta de spy bloqueada de ${ip} — UA: ${ua}`);
+        logSecurityAlert(`🔴 Ferramenta de spy bloqueada de \`${ip}\` — UA: \`${ua}\``);
+        return res.status(403).json({ status: "error", message: "Acesso negado." });
+    }
+
     next();
 }
 
@@ -248,6 +275,54 @@ async function confirmarPagamento(user, hours, channel) {
     }
     console.log(`[PAYMENT] ✅ Key gerada para ${user.tag}: ${keyName} (${hours}h)`);
 }
+
+// ─── SOCKET.IO — AUTENTICAÇÃO ANTES DA CONEXÃO ────────────────────────────────
+// O middleware io.use() roda ANTES de aceitar a conexão WebSocket.
+// O cliente precisa passar key, secret e hwid no handshake.
+// Exemplo no lado cliente (Lua via HttpService ou script JS):
+//   socket = io(URL, {
+//     auth: { key="SUA-KEY", secret="SEU-SECRET", hwid="SEU-HWID" },
+//     extraHeaders: { ["x-bob-client"] = "BobJoiner-v2" }
+//   })
+io.use((socket, next) => {
+    const key    = socket.handshake.auth?.key    || socket.handshake.query?.key;
+    const secret = socket.handshake.auth?.secret || socket.handshake.query?.secret;
+    const hwid   = socket.handshake.auth?.hwid   || socket.handshake.query?.hwid;
+    const header = socket.handshake.headers?.["x-bob-client"];
+    const ua     = (socket.handshake.headers?.["user-agent"] || "").toLowerCase();
+    const ip     = (socket.handshake.headers?.["x-forwarded-for"] || "").split(",")[0].trim()
+                || socket.handshake.address || "unknown";
+
+    // Bloqueia header inválido
+    if (!header || header !== CLIENT_HEADER) {
+        logSecurityAlert(`⚠️ WebSocket sem header válido de \`${ip}\``);
+        return next(new Error("Acesso negado."));
+    }
+
+    // Bloqueia ferramentas de spy
+    if (BLOCKED_UA.some(b => ua.includes(b))) {
+        blockedIPs[ip] = Date.now() + BLOCK_DURATION;
+        logSecurityAlert(`🔴 Ferramenta de spy no WebSocket de \`${ip}\` — UA: \`${ua}\``);
+        return next(new Error("Acesso negado."));
+    }
+
+    // Valida a key ANTES de aceitar a conexão
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) {
+        console.warn(`[SOCKET] Conexão recusada (${r.error}) de ${ip}`);
+        return next(new Error(r.error));
+    }
+
+    socket.keyName = r.keyName; // salva na sessão do socket
+    console.log(`[SOCKET] ✅ Conectado: ${r.keyName} (${ip})`);
+    next();
+});
+
+io.on("connection", (socket) => {
+    socket.on("disconnect", () => {
+        console.log(`[SOCKET] Desconectado: ${socket.keyName}`);
+    });
+});
 
 // ─── BOT NOTIFIER ─────────────────────────────────────────────────────────────
 const clientNotifier = new Client({
@@ -341,15 +416,8 @@ async function sendLogsPanel() {
     } catch (e) { console.error("[LOGS] Erro ao enviar painel:", e.message); }
 }
 
-// ─── BUILD ONLINE EMBED ───────────────────────────────────────────────────────
-// Lista TODAS as keys ativas do banco.
-// Formato: ✅ @Discord (NomeNoJogo) — ⏱️ 2h 30m
-// O nome no jogo vem do presence (último heartbeat), se disponível.
-// Se a pessoa sair do jogo, a key continua aparecendo — apenas o nome some.
 function buildOnlineEmbed() {
     const now = Date.now();
-
-    // Monta mapa keyName -> robloxName usando o presence mais recente
     const robloxByKey = {};
     for (const [, info] of Object.entries(presence)) {
         const keyName = info.key ? findKey(info.key) : null;
@@ -357,36 +425,24 @@ function buildOnlineEmbed() {
             robloxByKey[keyName] = info.name || null;
         }
     }
-
-    // Filtra keys ativas (inclui pausadas)
     const activeKeys = Object.entries(keys).filter(([, d]) => {
         if (d.paused) return true;
         if (d.expiry === Infinity) return true;
         return d.expiry - now > 0;
     });
-
     const embed = new EmbedBuilder()
         .setTitle("📋 Keys Ativas — Bob Joiner")
         .setColor(0x5865F2)
         .setFooter({ text: `Bob Joiner • ${activeKeys.length} key(s) ativa(s) • Atualizado` })
         .setTimestamp();
-
     if (!activeKeys.length) {
         embed.setDescription("Nenhuma key ativa no momento.");
         return embed;
     }
-
     const lines = activeKeys.map(([keyName, d]) => {
-        // Ícone de status
-        const status = d.paused ? "⏸️" : "✅";
-
-        // Mention Discord
-        const mention = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
-
-        // Nome no jogo — vem do presence; se não estiver jogando mostra traço
-        const robloxName = robloxByKey[keyName] || "—";
-
-        // Tempo restante
+        const status      = d.paused ? "⏸️" : "✅";
+        const mention     = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
+        const robloxName  = robloxByKey[keyName] || "—";
         let timeStr;
         if (d.paused) {
             timeStr = formatTime(d.remaining);
@@ -395,11 +451,8 @@ function buildOnlineEmbed() {
         } else {
             timeStr = formatTime(d.expiry - now);
         }
-
-        // Formato: ✅ @LanzinUSUARIO (NZW_SLOw) — ⏱️ 2h 30m
         return `${status} ${mention} **(${robloxName})** — ⏱️ \`${timeStr}\``;
     });
-
     embed.setDescription(lines.join("\n").substring(0, 4000));
     return embed;
 }
@@ -409,7 +462,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton()) return;
     if (!interaction.customId.startsWith("logs_")) return;
 
-    // ════ BLOQUEIO DE CARGO ════
     const member  = interaction.member;
     const hasRole = member?.roles?.cache?.has("1477885793144930496")
                  || member?.roles?.cache?.has("1501356382677373101")
@@ -418,7 +470,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "❌ Você não tem permissão para usar este painel.", ephemeral: true });
         return;
     }
-    // ══════════════════════════
 
     const id = interaction.customId;
 
@@ -925,7 +976,7 @@ clientPayment.on("messageCreate", async (msg) => {
 
 // ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok", time: Date.now() }));
-app.get("/",       (req, res) => res.send("<h1>Bob API v10 — Online ✅</h1>"));
+app.get("/",       (req, res) => res.send("<h1>Bob API — Online ✅</h1>"));
 
 app.get("/validate", requireClientHeader, (req, res) => {
     const { key, secret, hwid } = req.query;
@@ -1011,8 +1062,8 @@ if (DISCORD_TOKEN_PANEL) clientPanel.login(DISCORD_TOKEN_PANEL).then(() => conso
 else console.warn("[PANEL] Token ausente.");
 
 if (DISCORD_TOKEN_PAYMENT) clientPayment.login(DISCORD_TOKEN_PAYMENT).then(() => console.log("[PAYMENT] Login OK")).catch(e => console.error("[PAYMENT] Erro:", e.message));
-else console.warn("[PAYMENT] Token ausente — adicione DISCORD_TOKEN_PAYMENT no .env!");
+else console.warn("[PAYMENT] Token ausente.");
 
-if (MONGODB_URI) loadKeys();
+loadKeys();
 
 server.listen(port, () => console.log(`[SERVER] Porta ${port}`));
