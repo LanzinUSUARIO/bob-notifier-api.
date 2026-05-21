@@ -1372,18 +1372,21 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
     const id   = interaction.customId;
     const user = interaction.user;
 
+    // ✅ CORREÇÃO: deferReply imediato evita timeout de 3s do Discord
+    await interaction.deferReply({ flags: 64 });
+
     if (id.startsWith("buy_") && id !== "buy_minhakey") {
         const plan = PLANS.find(p => p.value === id.replace("buy_", ""));
-        if (!plan) return interaction.reply({ content: "❌ Plano inválido!", flags: 64 });
+        if (!plan) return interaction.editReply({ content: "❌ Plano inválido!" });
 
-        // ✅ Verifica se já tem pedido pendente ativo
+        // Verifica se já tem pedido pendente ativo
         const existing = await PendingPayment.findOne({ discordId: user.id });
         const now      = Date.now();
         if (existing) {
             const age       = now - new Date(existing.createdAt).getTime();
             const remaining = PENDING_EXPIRY_MS - age;
             if (remaining > 0) {
-                return interaction.reply({ embeds: [new EmbedBuilder()
+                return interaction.editReply({ embeds: [new EmbedBuilder()
                     .setColor(0xFFA500)
                     .setTitle("⚠️ Você já tem um pedido pendente!")
                     .setDescription(
@@ -1392,7 +1395,7 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
                         `Efetue o pagamento ou aguarde o cancelamento automático para fazer um novo pedido.`
                     )
                     .setFooter({ text: "Bob Keys" })
-                ], flags: 64 });
+                ]});
             }
         }
 
@@ -1402,21 +1405,19 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
             { upsert: true, new: true }
         );
 
-        // ✅ NOVO: Avisa o usuário via DM sobre o prazo de 15 minutos
-        try {
-            await user.send({ embeds: [new EmbedBuilder()
-                .setColor(0xFFA500)
-                .setTitle("⏳ Lembrete: Você tem 15 minutos para pagar!")
-                .setDescription(
-                    `Seu pedido de **${plan.label}** (R$${plan.price}) foi registrado.\n\n` +
-                    `Envie o comprovante no canal de compras em até **15 minutos** ou o pedido será cancelado automaticamente.`
-                )
-                .setFooter({ text: "Bob Keys • Aviso automático" })
-                .setTimestamp()
-            ]});
-        } catch {}
+        // Avisa o usuário via DM sobre o prazo de 15 minutos (não bloqueia a resposta)
+        user.send({ embeds: [new EmbedBuilder()
+            .setColor(0xFFA500)
+            .setTitle("⏳ Lembrete: Você tem 15 minutos para pagar!")
+            .setDescription(
+                `Seu pedido de **${plan.label}** (R$${plan.price}) foi registrado.\n\n` +
+                `Envie o comprovante no canal de compras em até **15 minutos** ou o pedido será cancelado automaticamente.`
+            )
+            .setFooter({ text: "Bob Keys • Aviso automático" })
+            .setTimestamp()
+        ]}).catch(() => {});
 
-        return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ccff).setTitle("💳 Dados para Pagamento Pix")
+        return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x00ccff).setTitle("💳 Dados para Pagamento Pix")
             .setDescription(
                 `**Plano:** ${plan.emoji} ${plan.label}\n**Valor:** R$${plan.price},00\n\n` +
                 `**🔑 Chave Pix:**\n\`\`\`${PIX_KEY}\`\`\`\n**Nome:** ${PIX_NAME}\n\n` +
@@ -1424,18 +1425,18 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
                 `> ⚠️ Você tem **15 minutos** para efetuar o pagamento.\n` +
                 `> Um admin confirma e a key chega no seu privado.`
             )
-            .setFooter({ text: `Pedido registrado • ${user.tag}` }).setTimestamp()], flags: 64 });
+            .setFooter({ text: `Pedido registrado • ${user.tag}` }).setTimestamp()] });
     }
 
     if (id === "buy_minhakey") {
         const userKeys = Object.entries(keys).filter(([, d]) => d.discordId === user.id);
-        if (!userKeys.length) return interaction.reply({ content: "❌ Nenhuma key ativa! Use a loja para comprar.", flags: 64 });
+        if (!userKeys.length) return interaction.editReply({ content: "❌ Nenhuma key ativa! Use a loja para comprar." });
         const now  = Date.now();
         const list = userKeys.map(([k, d]) => {
             const rem = d.expiry === Infinity ? "Lifetime ♾️" : (d.expiry - now > 0 ? formatTime(d.expiry - now) : "❌ Expirada");
             return `\`${k}\` — ⏳ ${rem}`;
         }).join("\n");
-        return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff88).setTitle("🔑 Suas Keys").setDescription(list).setFooter({ text: user.tag })], flags: 64 });
+        return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x00ff88).setTitle("🔑 Suas Keys").setDescription(list).setFooter({ text: user.tag })] });
     }
 });
 
