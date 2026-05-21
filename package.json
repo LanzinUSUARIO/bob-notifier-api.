@@ -8,7 +8,9 @@
   "dependencies": {
     "cors": "^2.8.6",
     "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
     "express": "^4.22.1",
+    "express-session": "^1.19.0",
     "mongoose": "^9.6.1",
     "socket.io": "^4.8.3"
   },
