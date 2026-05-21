@@ -14,11 +14,16 @@ const mongoose = require("mongoose");
 const LIFETIME_VALUE    = 9_999_999_999_999;
 const BRAINROT_MAX      = 100;
 const JOBID_MAX         = 500;
-const PRESENCE_TTL      = 2  * 60 * 1_000;   // 2 min
-const ONLINE_STALE_MS   = 30 * 1_000;         // 30s
+const PRESENCE_TTL      = 2  * 60 * 1_000;
+const ONLINE_STALE_MS   = 30 * 1_000;
 const RATE_LIMIT_MAX    = 60;
 const RATE_LIMIT_WINDOW = 60_000;
-const BLOCK_DURATION    = 5  * 60 * 1_000;    // 5 min
+const BLOCK_DURATION    = 5  * 60 * 1_000;
+
+// ✅ NOVO: Tempo de expiração de pedidos pendentes (15 minutos)
+const PENDING_EXPIRY_MS  = 15 * 60 * 1_000;  // 15 min
+const PENDING_WARN_MS    = 15 * 60 * 1_000;  // Avisa 15 min antes (= na criação, para pedidos novos o aviso é imediato já que o tempo é 15min)
+// Na prática: pedido criado → aviso de 0min → expira em 15min
 
 const BLOCKED_UA = [
     "python-requests","python-httpx","curl","wget","httpie",
@@ -80,14 +85,28 @@ const KeySchema = new mongoose.Schema({
 const KeyModel = mongoose.model("Key", KeySchema);
 
 const PendingPaymentSchema = new mongoose.Schema({
-    discordId:  String,
-    discordTag: String,
-    hours:      Number,
-    price:      Number,
-    label:      String,
-    createdAt:  { type: Date, default: Date.now },
+    discordId:   String,
+    discordTag:  String,
+    hours:       Number,
+    price:       Number,
+    label:       String,
+    warningSent: { type: Boolean, default: false },   // ✅ NOVO: controle de aviso enviado
+    createdAt:   { type: Date, default: Date.now },
 });
 const PendingPayment = mongoose.model("PendingPayment", PendingPaymentSchema);
+
+// ✅ NOVO: Schema de histórico de vendas
+const SaleHistorySchema = new mongoose.Schema({
+    discordId:   String,
+    discordTag:  String,
+    hours:       Number,
+    price:       Number,
+    label:       String,
+    keyName:     String,
+    confirmedBy: { type: String, default: "auto" }, // "auto" ou ID do admin
+    confirmedAt: { type: Date, default: Date.now },
+});
+const SaleHistory = mongoose.model("SaleHistory", SaleHistorySchema);
 
 // ─── ESTADO ───────────────────────────────────────────────────────────────────
 const keys       = {};
@@ -106,7 +125,6 @@ function xorObfuscate(value) {
     return Buffer.from(result, "binary").toString("base64");
 }
 
-// Timing-safe — evita timing attacks na senha admin
 function safeCompare(a, b) {
     try {
         const ba = Buffer.from(String(a));
@@ -130,8 +148,18 @@ const formatTime = (ms) => {
     return parts.join(" ");
 };
 
+// ✅ NOVO: Formata tempo restante de forma amigável
+const formatTimeShort = (ms) => {
+    if (ms <= 0) return "expirado";
+    const m = Math.floor(ms / 60_000);
+    const s = Math.floor((ms % 60_000) / 1000);
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+};
+
 const findKey    = (name) => Object.keys(keys).find(k => k.toLowerCase() === (name || "").trim().toLowerCase());
 const tsRelative = (date) => `<t:${Math.floor(new Date(date).getTime() / 1000)}:R>`;
+const tsAbsolute = (date) => `<t:${Math.floor(new Date(date).getTime() / 1000)}:f>`;
 
 function generateBobKey() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -146,7 +174,6 @@ function pushBrainrot(payload) {
     io.emit("brainrot", payload);
 }
 
-// Busca usuário em qualquer bot disponível
 async function fetchUserFromAnyClient(userId) {
     for (const client of [clientLogs, clientPayment, clientPanel, clientNotifier]) {
         try {
@@ -206,10 +233,89 @@ setInterval(async () => {
         if (now - info.lastSeen > PRESENCE_TTL) delete presence[sid];
     }
 
-    // JobIDs — limita tamanho máximo
+    // JobIDs
     const jobKeys = Object.keys(userJobIds);
     if (jobKeys.length > JOBID_MAX)
         jobKeys.slice(0, jobKeys.length - JOBID_MAX).forEach(k => delete userJobIds[k]);
+
+}, 60_000);
+
+// ✅ NOVO: Cleanup de pedidos pendentes expirados (roda a cada 60s)
+setInterval(async () => {
+    const now     = Date.now();
+    const cutoff  = new Date(now - PENDING_EXPIRY_MS);
+    const warnAt  = new Date(now - (PENDING_EXPIRY_MS - 60_000)); // avisa quando falta ~1min (aqui: imediatamente pois 15min = tempo total)
+
+    try {
+        // Pedidos que já passaram do tempo limite → remover e notificar
+        const expired = await PendingPayment.find({ createdAt: { $lt: cutoff } });
+        for (const p of expired) {
+            console.log(`[PENDING CLEANUP] Pedido expirado de ${p.discordTag} (${p.discordId}) — ${p.label}`);
+
+            // Notifica o usuário que o pedido foi cancelado
+            try {
+                const user = await fetchUserFromAnyClient(p.discordId);
+                if (user) {
+                    await user.send({ embeds: [
+                        new EmbedBuilder()
+                            .setColor(0xFF3C3C)
+                            .setTitle("❌ Pedido Cancelado por Inatividade")
+                            .setDescription(
+                                `Seu pedido de **${p.label}** (R$${p.price}) foi cancelado por falta de pagamento.\n\n` +
+                                `⏱️ Tempo limite: **15 minutos**\n\n` +
+                                `Se deseja comprar, acesse a loja novamente e efetue o pagamento em até **15 minutos** após escolher o plano.`
+                            )
+                            .setFooter({ text: "Bob Keys • Pedido cancelado automaticamente" })
+                            .setTimestamp(),
+                    ]});
+                }
+            } catch {}
+
+            await PendingPayment.deleteOne({ _id: p._id });
+
+            // Loga no canal de logs
+            if (LOGS_CHANNEL_ID) {
+                try {
+                    const ch = await clientLogs.channels.fetch(LOGS_CHANNEL_ID);
+                    if (ch) await ch.send({ embeds: [
+                        new EmbedBuilder()
+                            .setColor(0xFF3C3C)
+                            .setTitle("🗑️ Pedido Cancelado por Inatividade")
+                            .setDescription(`**Usuário:** <@${p.discordId}> (${p.discordTag})\n**Plano:** ${p.label}\n**Valor:** R$${p.price}\n**Criado:** ${tsAbsolute(p.createdAt)}`)
+                            .setTimestamp(),
+                    ]});
+                } catch {}
+            }
+        }
+
+        // ✅ Aviso de 15min antes: como o tempo total É 15min, avisamos logo na criação.
+        // Aqui fazemos o aviso para pedidos com mais de (PENDING_EXPIRY_MS - 60_000)ms (faltando ~1min)
+        const toWarn = await PendingPayment.find({
+            warningSent: false,
+            createdAt: { $lt: new Date(now - (PENDING_EXPIRY_MS - 60_000)) },
+        });
+        for (const p of toWarn) {
+            try {
+                const user = await fetchUserFromAnyClient(p.discordId);
+                if (user) {
+                    await user.send({ embeds: [
+                        new EmbedBuilder()
+                            .setColor(0xFFA500)
+                            .setTitle("⚠️ Seu pedido vai expirar em 1 minuto!")
+                            .setDescription(
+                                `Seu pedido de **${p.label}** (R$${p.price}) está prestes a ser cancelado!\n\n` +
+                                `Envie o comprovante **agora** no canal de compras para não perder seu pedido.\n\n` +
+                                `> Se não pagar em breve, o pedido será cancelado automaticamente.`
+                            )
+                            .setFooter({ text: "Bob Keys • Aviso automático" })
+                            .setTimestamp(),
+                    ]});
+                }
+            } catch {}
+            await PendingPayment.updateOne({ _id: p._id }, { warningSent: true });
+        }
+
+    } catch (e) { console.error("[PENDING CLEANUP] Erro:", e.message); }
 
 }, 60_000);
 
@@ -234,7 +340,7 @@ function getRealIP(req) {
 }
 
 async function logSecurityAlert(message) {
-    console.warn("[SECURITY ALERT]", message); // sempre no console
+    console.warn("[SECURITY ALERT]", message);
     if (!LOGS_CHANNEL_ID) return;
     try {
         const ch = await clientLogs.channels.fetch(LOGS_CHANNEL_ID);
@@ -251,10 +357,8 @@ async function logSecurityAlert(message) {
 function rateLimitMiddleware(req, res, next) {
     const openRoutes = ["/health", "/"];
     if (openRoutes.includes(req.path)) return next();
-
     const ip  = getRealIP(req);
     const now = Date.now();
-
     if (blockedIPs[ip]) {
         if (now < blockedIPs[ip]) {
             const remaining = Math.ceil((blockedIPs[ip] - now) / 1000);
@@ -262,16 +366,13 @@ function rateLimitMiddleware(req, res, next) {
         }
         delete blockedIPs[ip];
     }
-
     if (!rateLimitMap[ip] || now - rateLimitMap[ip].windowStart > RATE_LIMIT_WINDOW) {
         rateLimitMap[ip] = { count: 1, windowStart: now };
         return next();
     }
-
     rateLimitMap[ip].count++;
     if (rateLimitMap[ip].count > RATE_LIMIT_MAX) {
         blockedIPs[ip] = now + BLOCK_DURATION;
-        console.warn(`[SECURITY] IP bloqueado por rate limit: ${ip}`);
         logSecurityAlert(`🔴 IP \`${ip}\` bloqueado por rate limit`);
         return res.status(429).json({ status: "error", message: "Muitas requisições. IP bloqueado por 5 minutos." });
     }
@@ -282,18 +383,15 @@ function requireClientHeader(req, res, next) {
     const header = req.headers["x-bob-client"];
     const ua     = (req.headers["user-agent"] || "").toLowerCase();
     const ip     = getRealIP(req);
-
     if (!header || header !== CLIENT_HEADER) {
         logSecurityAlert(`⚠️ Acesso sem header válido de \`${ip}\` em \`${req.path}\``);
         return res.status(403).json({ status: "error", message: "Acesso negado." });
     }
-
     if (BLOCKED_UA.some(b => ua.includes(b))) {
         blockedIPs[ip] = Date.now() + BLOCK_DURATION;
         logSecurityAlert(`🔴 Ferramenta de spy bloqueada de \`${ip}\` — UA: \`${ua}\``);
         return res.status(403).json({ status: "error", message: "Acesso negado." });
     }
-
     next();
 }
 
@@ -308,26 +406,18 @@ io.use((socket, next) => {
     const ua     = (socket.handshake.headers?.["user-agent"] || "").toLowerCase();
     const ip     = (socket.handshake.headers?.["x-forwarded-for"] || "").split(",")[0].trim()
                 || socket.handshake.address || "unknown";
-
     if (!header || header !== CLIENT_HEADER) {
         logSecurityAlert(`⚠️ WebSocket sem header válido de \`${ip}\``);
         return next(new Error("Acesso negado."));
     }
-
     if (BLOCKED_UA.some(b => ua.includes(b))) {
         blockedIPs[ip] = Date.now() + BLOCK_DURATION;
         logSecurityAlert(`🔴 Ferramenta de spy no WebSocket de \`${ip}\` — UA: \`${ua}\``);
         return next(new Error("Acesso negado."));
     }
-
     const r = checkKey(key, secret, hwid);
-    if (!r.ok) {
-        console.warn(`[SOCKET] Conexão recusada (${r.error}) de ${ip}`);
-        return next(new Error(r.error));
-    }
-
+    if (!r.ok) { return next(new Error(r.error)); }
     socket.keyName = r.keyName;
-    console.log(`[SOCKET] ✅ Conectado: ${r.keyName} (${ip})`);
     next();
 });
 
@@ -356,9 +446,16 @@ function checkKey(key, secret, hwid) {
 }
 
 // ─── PAGAMENTO ────────────────────────────────────────────────────────────────
-async function confirmarPagamento(user, hours, channel) {
+async function confirmarPagamento(user, hours, channel, confirmedBy = "admin", price = null, label = null) {
     const keyName   = generateBobKey();
     const expiresAt = Date.now() + hours * 3_600_000;
+
+    // Detecta preço e label automaticamente se não fornecido
+    if (!price || !label) {
+        const plan = PLANS.find(p => p.hours === hours);
+        price = price || plan?.price || hours * 5;
+        label = label || plan?.label || `${hours}h`;
+    }
 
     keys[keyName] = {
         expiry:    expiresAt,
@@ -369,13 +466,26 @@ async function confirmarPagamento(user, hours, channel) {
     };
     await saveKey(keyName);
 
+    // ✅ NOVO: Salva no histórico de vendas
+    try {
+        await SaleHistory.create({
+            discordId:   String(user.id),
+            discordTag:  user.tag,
+            hours,
+            price,
+            label,
+            keyName,
+            confirmedBy: String(confirmedBy),
+        });
+    } catch (e) { console.error("[SALE HISTORY] Erro ao salvar:", e.message); }
+
     const dmEmbed = new EmbedBuilder()
         .setColor(0x00ff88)
         .setTitle("🎉 Pagamento Confirmado!")
         .setDescription(
             `Sua key foi gerada com sucesso!\n\n` +
             `**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n` +
-            `**Plano:** ${hours}h\n` +
+            `**Plano:** ${label}\n` +
             `**Expira:** ${tsRelative(expiresAt)}\n\n` +
             `Use essa key para ativar o Bob Joiner!`
         )
@@ -394,9 +504,10 @@ async function confirmarPagamento(user, hours, channel) {
             .setTitle("✅ Key Gerada")
             .setDescription(
                 `**Usuário:** <@${user.id}> (${user.tag})\n` +
-                `**Plano:** ${hours}h\n` +
+                `**Plano:** ${label}\n` +
                 `**Key:** \`${keyName}\`\n` +
                 `**Expira:** ${tsRelative(expiresAt)}\n` +
+                `**Confirmado por:** ${confirmedBy === "auto" ? "🤖 Automático" : `<@${confirmedBy}>`}\n` +
                 `**DM enviada:** ${dmOk ? "✅ Sim" : "❌ Não (DMs fechadas)"}`
             )
             .setTimestamp(),
@@ -406,8 +517,7 @@ async function confirmarPagamento(user, hours, channel) {
     console.log(`[PAYMENT] ✅ Key gerada para ${user.tag} (${user.id}): ${keyName} (${hours}h) | DM: ${dmOk}`);
 }
 
-// ─── KEY OPERATIONS (centralizadas) ──────────────────────────────────────────
-
+// ─── KEY OPERATIONS ────────────────────────────────────────────────────────────
 async function opCreateKey(name, durationMs, discordId = null) {
     if (findKey(name)) return { ok: false, msg: `❌ Chave \`${name}\` já existe!` };
     if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" };
@@ -536,7 +646,6 @@ clientNotifier.on("messageCreate", async (message) => {
     };
 
     pushBrainrot(payload);
-    console.log(`[NOTIFIER] ✅ ${payload.title} | jobId: ${jobId}`);
 });
 
 // ─── BOT LOGS ─────────────────────────────────────────────────────────────────
@@ -561,7 +670,8 @@ function buildLogsEmbed() {
             "⏱️ **Tempo** — addtime, setexpiry\n" +
             "📊 **Informações** — online, stats, lookup, jobids\n" +
             "🛡️ **Segurança** — blocked, unblock\n" +
-            "🧹 **Utilitários** — cleanlogs, test"
+            "🧹 **Utilitários** — cleanlogs, test\n" +
+            "💳 **Pagamentos** — pendentes, confirmar, cancelar, histórico"
         )
         .setFooter({ text: "Bob Joiner Admin Panel • Todos os comandos requerem senha de admin" })
         .setTimestamp();
@@ -596,10 +706,13 @@ function buildLogsRows() {
             new ButtonBuilder().setCustomId("logs_cleanlogs").setLabel("Limpar Logs").setEmoji("🧹").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("logs_test").setLabel("Teste").setEmoji("🧪").setStyle(ButtonStyle.Secondary),
         ),
+        // ✅ NOVO: Linha de pagamentos expandida
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("logs_pendentes").setLabel("Pendentes Pix").setEmoji("⏳").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("logs_confirmar_manual").setLabel("Confirmar Pagamento").setEmoji("💳").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("logs_confirmar_manual").setLabel("Confirmar Pgto").setEmoji("💳").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("logs_cancelar_pedido").setLabel("Cancelar Pedido").setEmoji("❌").setStyle(ButtonStyle.Danger),  // ✅ NOVO
             new ButtonBuilder().setCustomId("logs_vendas").setLabel("Vendas").setEmoji("💰").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("logs_historico").setLabel("Histórico").setEmoji("📜").setStyle(ButtonStyle.Secondary),          // ✅ NOVO
         ),
     ];
 }
@@ -620,23 +733,18 @@ async function sendLogsPanel() {
 function buildOnlineEmbed() {
     const now = Date.now();
     const robloxByKey = {};
-
     for (const [, info] of Object.entries(presence)) {
         const keyName = info.key ? findKey(info.key) : null;
         if (keyName && !robloxByKey[keyName] && now - info.lastSeen < PRESENCE_TTL)
             robloxByKey[keyName] = info.name || null;
     }
-
     const activeKeys = Object.entries(keys).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
-
     const embed = new EmbedBuilder()
         .setTitle("📋 Keys Ativas — Bob Joiner")
         .setColor(0x5865F2)
         .setFooter({ text: `Bob Joiner • ${activeKeys.length} key(s) ativa(s) • Atualizado` })
         .setTimestamp();
-
     if (!activeKeys.length) { embed.setDescription("Nenhuma key ativa no momento."); return embed; }
-
     const lines = activeKeys.map(([keyName, d]) => {
         const status     = d.paused ? "⏸️" : "✅";
         const mention    = d.discordId ? `<@${d.discordId}>` : "*(sem Discord)*";
@@ -647,7 +755,6 @@ function buildOnlineEmbed() {
         else timeStr = formatTime(d.expiry - now);
         return `${status} ${mention} **(${robloxName})** — ⏱️ \`${timeStr}\``;
     });
-
     embed.setDescription(lines.join("\n").substring(0, 4000));
     return embed;
 }
@@ -656,7 +763,6 @@ function isAdmin(member) {
     return ADMIN_ROLE_IDS.some(id => member?.roles?.cache?.has(id));
 }
 
-// Intervalos do !online — keyed por channelId
 if (!global.onlineIntervals) global.onlineIntervals = {};
 
 function startOnlineInterval(channelId, messageObj) {
@@ -677,7 +783,7 @@ function stopOnlineInterval(channelId) {
 clientLogs.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isModalSubmit()) { await handleLogsModal(interaction); return; }
     if (!interaction.isButton()) return;
-    if (!interaction.customId.startsWith("logs_") && !interaction.customId.startsWith("pay_confirm_")) return;
+    if (!interaction.customId.startsWith("logs_") && !interaction.customId.startsWith("pay_")) return;
 
     if (!isAdmin(interaction.member)) {
         await interaction.reply({ content: "❌ Você não tem permissão para usar este painel.", flags: 64 });
@@ -686,7 +792,6 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
 
     const id = interaction.customId;
 
-    // ── Botões sem modal ────────────────────────────────────────────────────────
     if (id === "logs_online") {
         await interaction.deferReply({ ephemeral: false });
         const sentMsg = await interaction.editReply({ embeds: [buildOnlineEmbed()] });
@@ -706,14 +811,16 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         const paused = all.filter(k => k.paused);
         const lt     = all.filter(k => k.expiry === Infinity);
         const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
+        const pendentes = await PendingPayment.countDocuments();
         await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("📊 Estatísticas Bob Joiner").setColor(0x5865F2)
             .addFields(
-                { name: "🔑 Total de Keys",   value: String(all.length),       inline: true },
-                { name: "✅ Ativas",           value: String(active.length),    inline: true },
-                { name: "⏸️ Pausadas",         value: String(paused.length),    inline: true },
-                { name: "♾️ Lifetime",         value: String(lt.length),        inline: true },
-                { name: "🟢 Online agora",     value: String(online.length),    inline: true },
-                { name: "📡 Brainrots (fila)", value: String(brainrots.length), inline: true },
+                { name: "🔑 Total de Keys",     value: String(all.length),       inline: true },
+                { name: "✅ Ativas",             value: String(active.length),    inline: true },
+                { name: "⏸️ Pausadas",           value: String(paused.length),    inline: true },
+                { name: "♾️ Lifetime",           value: String(lt.length),        inline: true },
+                { name: "🟢 Online agora",       value: String(online.length),    inline: true },
+                { name: "📡 Brainrots (fila)",   value: String(brainrots.length), inline: true },
+                { name: "⏳ Pedidos Pendentes",  value: String(pendentes),        inline: true },
             ).setTimestamp()] });
         return;
     }
@@ -756,22 +863,55 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferReply({ flags: 64 });
         const pendentes = await PendingPayment.find().sort({ createdAt: -1 });
         if (!pendentes.length) { await interaction.editReply({ content: "✅ Nenhum pedido pendente!" }); return; }
-        const list = pendentes.map(p => `• **${p.discordTag}** — ${p.label} (R$${p.price}) — ${tsRelative(p.createdAt)}`).join("\n");
+        const now  = Date.now();
+        const list = pendentes.map(p => {
+            const age        = now - new Date(p.createdAt).getTime();
+            const remaining  = PENDING_EXPIRY_MS - age;
+            const timeLeft   = remaining > 0 ? `⏳ expira em ${formatTimeShort(remaining)}` : "⚠️ expirando...";
+            return `• **${p.discordTag}** — ${p.label} (R$${p.price}) — ${tsRelative(p.createdAt)} — ${timeLeft}`;
+        }).join("\n");
         const rows = [];
         if (pendentes.length > 0) {
             const row = new ActionRowBuilder();
             pendentes.slice(0, 4).forEach(p => {
-                row.addComponents(new ButtonBuilder().setCustomId(`pay_confirm_${p.discordId}_${p.hours}`).setLabel(`✅ ${p.discordTag.split("#")[0].slice(0, 15)}`).setStyle(ButtonStyle.Success));
+                row.addComponents(new ButtonBuilder()
+                    .setCustomId(`pay_confirm_${p.discordId}_${p.hours}`)
+                    .setLabel(`✅ ${p.discordTag.split("#")[0].slice(0, 15)}`)
+                    .setStyle(ButtonStyle.Success));
             });
             rows.push(row);
+            // ✅ NOVO: Botões de cancelar individuais
+            if (pendentes.length > 0) {
+                const cancelRow = new ActionRowBuilder();
+                pendentes.slice(0, 4).forEach(p => {
+                    cancelRow.addComponents(new ButtonBuilder()
+                        .setCustomId(`pay_cancel_${p.discordId}`)
+                        .setLabel(`❌ ${p.discordTag.split("#")[0].slice(0, 15)}`)
+                        .setStyle(ButtonStyle.Danger));
+                });
+                rows.push(cancelRow);
+            }
         }
-        await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xffaa00).setTitle(`⏳ Pedidos Pendentes (${pendentes.length})`).setDescription(list)], components: rows });
+        await interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0xffaa00)
+            .setTitle(`⏳ Pedidos Pendentes (${pendentes.length}) — Expiram em 15min`)
+            .setDescription(list)
+            .setFooter({ text: "Pedidos são cancelados automaticamente após 15 minutos de inatividade" })
+        ], components: rows });
         return;
     }
     if (id === "logs_confirmar_manual") {
         await interaction.showModal(new ModalBuilder().setCustomId("modal_pay_confirm").setTitle("Confirmar Pagamento Manual").addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user_id").setLabel("ID do usuário Discord:").setStyle(TextInputStyle.Short).setPlaceholder("123456789012345678").setRequired(true)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("horas").setLabel("Quantidade de horas:").setStyle(TextInputStyle.Short).setPlaceholder("2").setRequired(true)),
+        ));
+        return;
+    }
+    // ✅ NOVO: Cancelar pedido manualmente pelo painel
+    if (id === "logs_cancelar_pedido") {
+        await interaction.showModal(new ModalBuilder().setCustomId("modal_cancel_pedido").setTitle("❌ Cancelar Pedido Pendente").addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user_id").setLabel("ID ou @ do usuário:").setStyle(TextInputStyle.Short).setPlaceholder("123456789012345678").setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("motivo").setLabel("Motivo (opcional):").setStyle(TextInputStyle.Short).setPlaceholder("Ex: Comprovante inválido").setRequired(false)),
         ));
         return;
     }
@@ -790,20 +930,57 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
         ).setTimestamp()] });
         return;
     }
+    // ✅ NOVO: Histórico de vendas
+    if (id === "logs_historico") {
+        await interaction.deferReply({ flags: 64 });
+        const sales = await SaleHistory.find().sort({ confirmedAt: -1 }).limit(20);
+        if (!sales.length) { await interaction.editReply({ content: "Nenhuma venda registrada ainda." }); return; }
+        const totalReceita = await SaleHistory.aggregate([{ $group: { _id: null, total: { $sum: "$price" } } }]);
+        const total = totalReceita[0]?.total || 0;
+        const lines = sales.map(s =>
+            `• <@${s.discordId}> — **${s.label}** (R$${s.price}) — \`${s.keyName}\` — ${tsRelative(s.confirmedAt)}`
+        ).join("\n");
+        await interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0x00ff88)
+            .setTitle(`📜 Histórico de Vendas (últimas 20)`)
+            .setDescription(lines.substring(0, 4000))
+            .addFields({ name: "💰 Total Arrecadado (todas as vendas)", value: `R$${total},00`, inline: false })
+            .setTimestamp()
+        ]});
+        return;
+    }
+    // Confirmação rápida via botão na lista de pendentes
     if (id.startsWith("pay_confirm_")) {
         await interaction.deferReply({ flags: 64 });
         const parts    = id.split("_");
         const targetId = parts[2];
         const hours    = parseInt(parts[3]);
+        const pending  = await PendingPayment.findOne({ discordId: targetId });
         const target   = await fetchUserFromAnyClient(targetId);
         if (!target) { await interaction.editReply({ content: "❌ Usuário não encontrado!" }); return; }
-        await confirmarPagamento(target, hours, interaction.channel);
+        await confirmarPagamento(target, hours, interaction.channel, interaction.user.id, pending?.price, pending?.label);
         await PendingPayment.deleteOne({ discordId: targetId });
         await interaction.editReply({ content: `✅ Key gerada e enviada na DM de **${target.tag}** (${hours}h)!` });
         return;
     }
+    // ✅ NOVO: Cancelamento rápido via botão na lista de pendentes
+    if (id.startsWith("pay_cancel_")) {
+        await interaction.deferReply({ flags: 64 });
+        const targetId = id.replace("pay_cancel_", "");
+        const pending  = await PendingPayment.findOne({ discordId: targetId });
+        if (!pending) { await interaction.editReply({ content: "❌ Pedido não encontrado." }); return; }
+        await PendingPayment.deleteOne({ discordId: targetId });
+        try {
+            const target = await fetchUserFromAnyClient(targetId);
+            if (target) await target.send({ embeds: [new EmbedBuilder()
+                .setColor(0xFF3C3C).setTitle("❌ Pedido Cancelado")
+                .setDescription(`Seu pedido de **${pending.label}** (R$${pending.price}) foi cancelado por um administrador.`)
+                .setTimestamp()] });
+        } catch {}
+        await interaction.editReply({ content: `🗑️ Pedido de **${pending.discordTag}** cancelado.` });
+        return;
+    }
 
-    // ── Botões que abrem modal ──────────────────────────────────────────────────
     const modalMap = {
         logs_create:     buildModal_create,
         logs_lifetime:   buildModal_lifetime,
@@ -833,14 +1010,35 @@ async function handleLogsModal(interaction) {
     };
 
     if (id === "modal_pay_confirm") {
-        const userId = getField("user_id").trim();
-        const hours  = parseInt(getField("horas").trim());
+        const userId  = getField("user_id").trim();
+        const hours   = parseInt(getField("horas").trim());
         if (isNaN(hours) || hours <= 0) { await interaction.editReply({ content: "❌ Horas inválidas!" }); return; }
-        const target = await fetchUserFromAnyClient(userId);
+        const pending = await PendingPayment.findOne({ discordId: userId });
+        const target  = await fetchUserFromAnyClient(userId);
         if (!target) { await interaction.editReply({ content: "❌ Usuário não encontrado!" }); return; }
-        await confirmarPagamento(target, hours, interaction.channel);
+        await confirmarPagamento(target, hours, interaction.channel, interaction.user.id, pending?.price, pending?.label);
         await PendingPayment.deleteOne({ discordId: userId });
         await interaction.editReply({ content: `✅ Key gerada para **${target.tag}** (${hours}h)!` });
+        return;
+    }
+    // ✅ NOVO: Cancelar pedido via modal
+    if (id === "modal_cancel_pedido") {
+        const userId  = getField("user_id").replace(/\D/g, "");
+        const motivo  = getField("motivo").trim() || "Sem motivo informado";
+        const pending = await PendingPayment.findOne({ discordId: userId });
+        if (!pending) { await interaction.editReply({ content: "❌ Nenhum pedido pendente encontrado para esse usuário." }); return; }
+        await PendingPayment.deleteOne({ discordId: userId });
+        try {
+            const target = await fetchUserFromAnyClient(userId);
+            if (target) await target.send({ embeds: [new EmbedBuilder()
+                .setColor(0xFF3C3C).setTitle("❌ Pedido Cancelado pelo Admin")
+                .setDescription(
+                    `Seu pedido de **${pending.label}** (R$${pending.price}) foi cancelado.\n\n` +
+                    `**Motivo:** ${motivo}\n\n` +
+                    `Entre em contato com um admin se tiver dúvidas.`
+                ).setTimestamp()] });
+        } catch {}
+        await interaction.editReply({ content: `🗑️ Pedido de **${pending.discordTag}** cancelado. Motivo: *${motivo}*` });
         return;
     }
     if (id === "modal_create") {
@@ -896,12 +1094,15 @@ async function handleLogsModal(interaction) {
         const t = findKey(getField("key_name").trim());
         if (!t) { await interaction.editReply({ content: "❌ Chave não encontrada." }); return; }
         const d = keys[t];
+        // ✅ NOVO: Adiciona histórico de compras no lookup
+        const sales = await SaleHistory.find({ keyName: t });
         await interaction.editReply({ embeds: [new EmbedBuilder().setTitle(`🔍 Info: ${t}`).setColor(d.paused ? 0xFFA000 : 0x00C853)
             .addFields(
                 { name: "⏱️ Tempo Restante", value: d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now()), inline: true },
                 { name: "📌 Status",          value: d.paused ? "⏸️ Pausada" : "✅ Ativa",                                      inline: true },
                 { name: "💻 HWID",            value: d.hwid ? `\`${d.hwid.substring(0, 12)}...\`` : "Livre",                   inline: false },
                 { name: "👤 Discord",          value: d.discordId ? `<@${d.discordId}>` : "*(não vinculado)*",                  inline: true },
+                { name: "🛒 Compra",          value: sales.length ? `${tsAbsolute(sales[0].confirmedAt)} (R$${sales[0].price})` : "*(sem registro)*", inline: true },
             ).setTimestamp()] });
         return;
     }
@@ -984,15 +1185,25 @@ clientLogs.on("messageCreate", async (message) => {
             const paused = all.filter(k => k.paused);
             const lt     = all.filter(k => k.expiry === Infinity);
             const online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
+            const pendentes = await PendingPayment.countDocuments();
             message.reply({ embeds: [new EmbedBuilder().setTitle("📊 Estatísticas").setColor(0x5865F2)
                 .addFields(
-                    { name: "🔑 Total",    value: String(all.length),       inline: true },
-                    { name: "✅ Ativas",   value: String(active.length),    inline: true },
-                    { name: "⏸️ Pausadas", value: String(paused.length),    inline: true },
-                    { name: "♾️ Lifetime", value: String(lt.length),        inline: true },
-                    { name: "🟢 Online",   value: String(online.length),    inline: true },
-                    { name: "📡 Fila",     value: String(brainrots.length), inline: true },
+                    { name: "🔑 Total",         value: String(all.length),       inline: true },
+                    { name: "✅ Ativas",         value: String(active.length),    inline: true },
+                    { name: "⏸️ Pausadas",       value: String(paused.length),    inline: true },
+                    { name: "♾️ Lifetime",       value: String(lt.length),        inline: true },
+                    { name: "🟢 Online",         value: String(online.length),    inline: true },
+                    { name: "📡 Fila",           value: String(brainrots.length), inline: true },
+                    { name: "⏳ Pix Pendentes",  value: String(pendentes),        inline: true },
                 ).setTimestamp()] });
+            break;
+        }
+        // ✅ NOVO: comando !historico
+        case "historico": {
+            const sales = await SaleHistory.find().sort({ confirmedAt: -1 }).limit(10);
+            if (!sales.length) { message.reply("Nenhuma venda registrada."); break; }
+            const lines = sales.map(s => `• <@${s.discordId}> — **${s.label}** R$${s.price} — \`${s.keyName}\` — ${tsRelative(s.confirmedAt)}`).join("\n");
+            message.reply({ embeds: [new EmbedBuilder().setTitle("📜 Últimas 10 Vendas").setColor(0x00ff88).setDescription(lines).setTimestamp()] });
             break;
         }
     }
@@ -1047,22 +1258,17 @@ clientPanel.on("ready", async () => {
 
 clientPanel.on("messageCreate", async (message) => {
     if (message.author.bot) return;
-
     if (message.channel.type === ChannelType.DM) {
         const state = awaitingInput[message.author.id];
         if (!state) return;
-
         const key     = message.content.trim();
         const keyName = findKey(key);
         if (!keyName) return message.reply("❌ Key não encontrada!");
-
         const d = keys[keyName];
         if (d.paused) return message.reply("⏸️ Sua key está pausada.");
         if (d.expiry !== Infinity && d.expiry - Date.now() <= 0) return message.reply("⌛ Sua key expirou!");
-
         const { step } = state;
         delete awaitingInput[message.author.id];
-
         if (step === "redeem_key") {
             return message.reply(`✅ Key válida! Tempo restante: **${d.expiry === Infinity ? "Lifetime ♾️" : formatTime(d.expiry - Date.now())}**`);
         }
@@ -1097,7 +1303,6 @@ clientPanel.on("messageCreate", async (message) => {
         }
         return;
     }
-
     if (message.content === "!panel") {
         try { await message.channel.send({ embeds: [buildPanelEmbed()], components: buildPanelRows() }); message.reply("✅ Painel enviado!"); }
         catch (e) { message.reply("❌ Erro: " + e.message); }
@@ -1108,7 +1313,6 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton()) return;
     const user = interaction.user;
     await interaction.deferReply({ flags: 64 });
-
     const steps = { panel_redeem: "redeem_key", panel_script: "script_key", panel_role: "role_key", panel_hwid: "hwid_key", panel_stats: "stats_key" };
     const msgs  = {
         panel_redeem: "🔑 **Redeem Key**\nEnvie sua key aqui para validar:",
@@ -1117,7 +1321,6 @@ clientPanel.on(Events.InteractionCreate, async (interaction) => {
         panel_hwid:   "⚙️ **Reset HWID**\nEnvie sua key:",
         panel_stats:  "📊 **Key Info**\nEnvie sua key:",
     };
-
     const step = steps[interaction.customId];
     if (step) {
         awaitingInput[user.id] = { step, guildId: interaction.guildId };
@@ -1135,7 +1338,12 @@ const clientPayment = new Client({
 function buildShopEmbed() {
     const planList = PLANS.map(p => `${p.emoji} **${p.label}** — R$${p.price},00`).join("\n");
     return new EmbedBuilder().setColor(0x00ff88).setTitle("🛒 Bob Keys — Loja")
-        .setDescription(`Escolha seu plano abaixo:\n\n${planList}\n\n> Após escolher, você receberá os dados do Pix.\n> Mande o comprovante aqui e um admin confirma sua key!`)
+        .setDescription(
+            `Escolha seu plano abaixo:\n\n${planList}\n\n` +
+            `> ⏱️ Após escolher, você terá **15 minutos** para efetuar o pagamento.\n` +
+            `> Após pagar, mande o comprovante aqui e um admin confirma sua key!\n` +
+            `> ⚠️ Pedidos sem pagamento são cancelados automaticamente.`
+        )
         .setFooter({ text: "Bob Keys • Sistema de Keys Automático" }).setTimestamp();
 }
 
@@ -1167,16 +1375,54 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
     if (id.startsWith("buy_") && id !== "buy_minhakey") {
         const plan = PLANS.find(p => p.value === id.replace("buy_", ""));
         if (!plan) return interaction.reply({ content: "❌ Plano inválido!", flags: 64 });
+
+        // ✅ Verifica se já tem pedido pendente ativo
+        const existing = await PendingPayment.findOne({ discordId: user.id });
+        const now      = Date.now();
+        if (existing) {
+            const age       = now - new Date(existing.createdAt).getTime();
+            const remaining = PENDING_EXPIRY_MS - age;
+            if (remaining > 0) {
+                return interaction.reply({ embeds: [new EmbedBuilder()
+                    .setColor(0xFFA500)
+                    .setTitle("⚠️ Você já tem um pedido pendente!")
+                    .setDescription(
+                        `Você já tem um pedido de **${existing.label}** aguardando pagamento.\n\n` +
+                        `⏳ Esse pedido expira em **${formatTimeShort(remaining)}**.\n\n` +
+                        `Efetue o pagamento ou aguarde o cancelamento automático para fazer um novo pedido.`
+                    )
+                    .setFooter({ text: "Bob Keys" })
+                ], flags: 64 });
+            }
+        }
+
         await PendingPayment.findOneAndUpdate(
             { discordId: user.id },
-            { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, label: plan.label },
+            { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, label: plan.label, warningSent: false, createdAt: new Date() },
             { upsert: true, new: true }
         );
+
+        // ✅ NOVO: Avisa o usuário via DM sobre o prazo de 15 minutos
+        try {
+            await user.send({ embeds: [new EmbedBuilder()
+                .setColor(0xFFA500)
+                .setTitle("⏳ Lembrete: Você tem 15 minutos para pagar!")
+                .setDescription(
+                    `Seu pedido de **${plan.label}** (R$${plan.price}) foi registrado.\n\n` +
+                    `Envie o comprovante no canal de compras em até **15 minutos** ou o pedido será cancelado automaticamente.`
+                )
+                .setFooter({ text: "Bob Keys • Aviso automático" })
+                .setTimestamp()
+            ]});
+        } catch {}
+
         return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ccff).setTitle("💳 Dados para Pagamento Pix")
             .setDescription(
                 `**Plano:** ${plan.emoji} ${plan.label}\n**Valor:** R$${plan.price},00\n\n` +
                 `**🔑 Chave Pix:**\n\`\`\`${PIX_KEY}\`\`\`\n**Nome:** ${PIX_NAME}\n\n` +
-                `> ✅ Após pagar, mande o **comprovante** aqui no canal!\n> Um admin confirma e a key chega no seu privado.`
+                `> ✅ Após pagar, mande o **comprovante** aqui no canal!\n` +
+                `> ⚠️ Você tem **15 minutos** para efetuar o pagamento.\n` +
+                `> Um admin confirma e a key chega no seu privado.`
             )
             .setFooter({ text: `Pedido registrado • ${user.tag}` }).setTimestamp()], flags: 64 });
     }
@@ -1252,7 +1498,6 @@ app.post("/api/notify", requireClientHeader, (req, res) => {
         players: "N/A",
     };
     pushBrainrot(payload);
-    console.log(`[NOTIFY] ✅ ${payload.title} → todos os usuários ativos`);
     res.json({ status: "ok", id: payload.id });
 });
 
@@ -1293,7 +1538,6 @@ app.get("/presence", requireClientHeader, (req, res) => {
     res.json(Object.keys(active).sort());
 });
 
-// Protegidos com autenticação
 app.get("/clients", requireClientHeader, (req, res) => {
     if (req.query.secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error", message: "Secret inválido." });
     res.send(`Socket.IO: ${io.sockets.sockets.size} | Presença: ${Object.keys(presence).length}`);
@@ -1320,7 +1564,6 @@ app.post("/push-brainrot", requireClientHeader, (req, res) => {
         players: players || "N/A",
     };
     pushBrainrot(payload);
-    console.log(`[PUSH] ✅ ${payload.title}`);
     res.json({ status: "ok", id: payload.id });
 });
 
@@ -1351,13 +1594,8 @@ app.use((err, req, res, next) => {
     res.status(500).json({ status: "error", message: "Erro interno do servidor." });
 });
 
-process.on("unhandledRejection", (reason) => {
-    console.error("[PROCESS] Rejeição não tratada:", reason);
-});
-
-process.on("uncaughtException", (err) => {
-    console.error("[PROCESS] Exceção não capturada:", err.message, err.stack);
-});
+process.on("unhandledRejection", (reason) => { console.error("[PROCESS] Rejeição não tratada:", reason); });
+process.on("uncaughtException",  (err)    => { console.error("[PROCESS] Exceção não capturada:", err.message, err.stack); });
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 async function loginBot(client, token, label) {
