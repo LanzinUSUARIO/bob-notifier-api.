@@ -313,7 +313,16 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
-app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { secure: process.env.RAILWAY_PUBLIC_DOMAIN ? true : false, maxAge: 7 * 24 * 60 * 60 * 1000 } }));
+app.use(session({ 
+  secret: SESSION_SECRET, 
+  resave: false, 
+  saveUninitialized: false, 
+  cookie: { 
+    secure: true,
+    sameSite: "none",
+    maxAge: 7 * 24 * 60 * 60 * 1000 
+  } 
+}));
 
 app.use((req, res, next) => {
     const allowed = [FRONTEND_URL, "http://localhost:3001", "http://localhost:3000"];
