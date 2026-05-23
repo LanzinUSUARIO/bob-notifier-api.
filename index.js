@@ -451,8 +451,13 @@ app.get("/auth/callback", async (req, res) => {
         const discordUser = await userRes.json();
         await User.findOneAndUpdate({ discordId: discordUser.id }, { discordTag: discordUser.username, avatar: discordUser.avatar }, { upsert: true, new: true });
         req.session.user = { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar };
-        await req.session.save();
-        res.redirect(`${FRONTEND_URL}/`);
+        req.session.save((err) => {
+            if (err) {
+                console.error("[AUTH] Erro ao salvar sessão:", err);
+                return res.redirect(`${FRONTEND_URL}?error=session_failed`);
+            }
+            res.redirect(`${FRONTEND_URL}/`);
+        });
     } catch (e) { console.error("[AUTH]", e.message); res.redirect(`${FRONTEND_URL}?error=auth_failed`); }
 });
 
