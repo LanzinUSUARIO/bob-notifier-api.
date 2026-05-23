@@ -3,8 +3,7 @@ const express  = require("express");
 const http     = require("http");
 const crypto   = require("crypto");
 const path     = require("path");
-const session  = require("express-session");
-const MongoStore = require("connect-mongo").default;
+const jwt      = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const {
     Client, GatewayIntentBits,
@@ -43,6 +42,7 @@ const ADMIN_PASS    = requireEnv("ADMIN_PASS");
 const SCRIPT_SECRET = requireEnv("SCRIPT_SECRET");
 const XOR_KEY       = requireEnv("XOR_KEY");
 const MONGODB_URI   = requireEnv("MONGODB_URI");
+const JWT_SECRET    = process.env.JWT_SECRET || "bobjoiner_jwt_secret_2026";
 
 const CLIENT_HEADER          = process.env.CLIENT_HEADER           || "BobJoiner-v2";
 const PIX_KEY                = process.env.PIX_KEY                 || "";
@@ -60,7 +60,6 @@ const SCRIPT_URL             = process.env.SCRIPT_URL              || "";
 const FRONTEND_URL           = process.env.FRONTEND_URL            || "http://localhost:3001";
 const DISCORD_CLIENT_ID      = process.env.DISCORD_CLIENT_ID       || "";
 const DISCORD_CLIENT_SECRET  = process.env.DISCORD_CLIENT_SECRET   || "";
-const SESSION_SECRET         = process.env.SESSION_SECRET          || "bobsecret";
 const REDIRECT_URI           = `${process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : "http://localhost:3000"}/auth/callback`;
 
 const ADMIN_ROLE_IDS = ["1477885793144930496","1501356382677373101","1477885797553148066"];
@@ -314,19 +313,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
-// ─── SESSION COM MONGODB ───────────────────────────────────────────────────────
-app.use(session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    store: MongoStore.create({ mongoUrl: MONGODB_URI }),
-    cookie: {
-        secure: true,
-        sameSite: "none",
-        maxAge: 7 * 24 * 60 * 60 * 1000
-    }
-}));
-
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
     const allowed = [FRONTEND_URL, "http://localhost:3001", "http://localhost:3000"];
     const origin = req.headers.origin;
@@ -334,7 +321,7 @@ app.use((req, res, next) => {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Access-Control-Allow-Credentials", "true");
         res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass,Authorization");
     }
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
@@ -370,7 +357,19 @@ function requireClientHeader(req, res, next) {
 
 app.use(rateLimitMiddleware);
 
-function requireAuth(req, res, next) { if (!req.session?.user) return res.status(401).json({ error: "Não autenticado" }); next(); }
+// ─── JWT AUTH ─────────────────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "Não autenticado" });
+    try {
+        req.user = jwt.verify(token, JWT_SECRET);
+        next();
+    } catch (e) {
+        return res.status(401).json({ error: "Token inválido ou expirado" });
+    }
+}
+
 function requireAdminAuth(req, res, next) { const pass = req.headers["x-admin-pass"] || req.query.pass; if (!safeCompare(pass, ADMIN_PASS)) return res.status(401).json({ error: "Sem permissão" }); next(); }
 
 io.use((socket, next) => {
@@ -449,22 +448,24 @@ app.get("/auth/callback", async (req, res) => {
         if (!tokenData.access_token) return res.redirect(`${FRONTEND_URL}?error=token`);
         const userRes = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: `Bearer ${tokenData.access_token}` } });
         const discordUser = await userRes.json();
-        await User.findOneAndUpdate({ discordId: discordUser.id }, { discordTag: discordUser.username, avatar: discordUser.avatar }, { upsert: true, new: true });
-        req.session.user = { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar };
-        req.session.save((err) => {
-            if (err) {
-                console.error("[AUTH] Erro ao salvar sessão:", err);
-                return res.redirect(`${FRONTEND_URL}?error=session_failed`);
-            }
-            res.redirect(`${FRONTEND_URL}/`);
-        });
+        await User.findOneAndUpdate(
+            { discordId: discordUser.id },
+            { discordTag: discordUser.username, avatar: discordUser.avatar },
+            { upsert: true, new: true }
+        );
+        const token = jwt.sign(
+            { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar },
+            JWT_SECRET,
+            { expiresIn: "7d" }
+        );
+        res.redirect(`${FRONTEND_URL}/?token=${token}`);
     } catch (e) { console.error("[AUTH]", e.message); res.redirect(`${FRONTEND_URL}?error=auth_failed`); }
 });
 
-app.get("/auth/logout", (req, res) => { req.session.destroy(); res.json({ ok: true }); });
+app.get("/auth/logout", (req, res) => { res.json({ ok: true }); });
 
 app.get("/auth/me", requireAuth, async (req, res) => {
-    const user = await User.findOne({ discordId: req.session.user.discordId });
+    const user = await User.findOne({ discordId: req.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
     const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === user.discordId);
     const keyData = keyEntry ? { name: keyEntry[0], expiry: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry, paused: keyEntry[1].paused, timeLeft: keyEntry[1].expiry === Infinity ? "Lifetime" : formatTime(keyEntry[1].expiry - Date.now()) } : null;
@@ -475,7 +476,7 @@ app.post("/api/buy", requireAuth, async (req, res) => {
     const { planValue } = req.body;
     const plan = PLANS.find(p => p.value === planValue && p.active);
     if (!plan) return res.status(400).json({ error: "Plano inválido" });
-    const user = await User.findOne({ discordId: req.session.user.discordId });
+    const user = await User.findOne({ discordId: req.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
     if (user.balance < plan.price) return res.status(400).json({ error: "Saldo insuficiente" });
     user.balance -= plan.price; await user.save();
@@ -485,7 +486,7 @@ app.post("/api/buy", requireAuth, async (req, res) => {
 });
 
 app.get("/api/transactions", requireAuth, async (req, res) => {
-    const transactions = await Transaction.find({ discordId: req.session.user.discordId }).sort({ createdAt: -1 }).limit(20);
+    const transactions = await Transaction.find({ discordId: req.user.discordId }).sort({ createdAt: -1 }).limit(20);
     res.json(transactions);
 });
 
