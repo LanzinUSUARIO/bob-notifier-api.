@@ -4,7 +4,7 @@ const http     = require("http");
 const crypto   = require("crypto");
 const path     = require("path");
 const session  = require("express-session");
-const MongoStore = require("connect-mongo");
+const MongoStore = require("connect-mongo").default;
 const { Server } = require("socket.io");
 const {
     Client, GatewayIntentBits,
