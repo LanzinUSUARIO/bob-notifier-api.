@@ -313,12 +313,12 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
-app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 } }));
+app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { secure: process.env.RAILWAY_PUBLIC_DOMAIN ? true : false, maxAge: 7 * 24 * 60 * 60 * 1000 } }));
 
 app.use((req, res, next) => {
-    const allowed = [FRONTEND_URL, "http://localhost:3001"];
+    const allowed = [FRONTEND_URL, "http://localhost:3001", "http://localhost:3000"];
     const origin = req.headers.origin;
-    if (allowed.includes(origin)) {
+    if (origin && (allowed.includes(origin) || origin.endsWith(".vercel.app"))) {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Access-Control-Allow-Credentials", "true");
         res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -439,7 +439,7 @@ app.get("/auth/callback", async (req, res) => {
         const discordUser = await userRes.json();
         await User.findOneAndUpdate({ discordId: discordUser.id }, { discordTag: discordUser.username, avatar: discordUser.avatar }, { upsert: true, new: true });
         req.session.user = { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar };
-        res.redirect(`${FRONTEND_URL}/dashboard`);
+        res.redirect(`${FRONTEND_URL}/`);
     } catch (e) { console.error("[AUTH]", e.message); res.redirect(`${FRONTEND_URL}?error=auth_failed`); }
 });
 
@@ -604,7 +604,17 @@ function buildModal_lookup() { return new ModalBuilder().setCustomId("modal_look
 function buildModal_unblock() { return new ModalBuilder().setCustomId("modal_unblock").setTitle("🔓 Desbloquear IP").addComponents(mkInput("ip_address","IP"),mkInput("key_pass","Senha")); }
 function buildModal_cleanlogs() { return new ModalBuilder().setCustomId("modal_cleanlogs").setTitle("🧹 Limpar Logs").addComponents(mkInput("key_pass","Senha")); }
 
-clientLogs.on("messageCreate", async (message) => { if (message.author.bot) return; if (message.content === "!logspanel") await sendLogsPanel(); });
+// ─── !online COMMAND CORRIGIDO ─────────────────────────────────────────────────
+clientLogs.on("messageCreate", async (message) => {
+    if (message.author.bot) return;
+    if (message.content === "!logspanel") await sendLogsPanel();
+    if (message.content === "!online") {
+        try {
+            const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] });
+            startOnlineInterval(message.channel.id, msg);
+        } catch (e) { console.error("[!online]", e.message); }
+    }
+});
 
 const clientPanel = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages], partials: [Partials.Channel, Partials.Message] });
 const awaitingInput = {};
