@@ -4,6 +4,7 @@ const http     = require("http");
 const crypto   = require("crypto");
 const path     = require("path");
 const session  = require("express-session");
+const MongoStore = require("connect-mongo");
 const { Server } = require("socket.io");
 const {
     Client, GatewayIntentBits,
@@ -313,15 +314,17 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
-app.use(session({ 
-  secret: SESSION_SECRET, 
-  resave: false, 
-  saveUninitialized: false, 
-  cookie: { 
-    secure: true,
-    sameSite: "none",
-    maxAge: 7 * 24 * 60 * 60 * 1000 
-  } 
+// ─── SESSION COM MONGODB ───────────────────────────────────────────────────────
+app.use(session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    store: MongoStore.create({ mongoUrl: MONGODB_URI }),
+    cookie: {
+        secure: true,
+        sameSite: "none",
+        maxAge: 7 * 24 * 60 * 60 * 1000
+    }
 }));
 
 app.use((req, res, next) => {
@@ -448,6 +451,7 @@ app.get("/auth/callback", async (req, res) => {
         const discordUser = await userRes.json();
         await User.findOneAndUpdate({ discordId: discordUser.id }, { discordTag: discordUser.username, avatar: discordUser.avatar }, { upsert: true, new: true });
         req.session.user = { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar };
+        await req.session.save();
         res.redirect(`${FRONTEND_URL}/`);
     } catch (e) { console.error("[AUTH]", e.message); res.redirect(`${FRONTEND_URL}?error=auth_failed`); }
 });
@@ -613,7 +617,6 @@ function buildModal_lookup() { return new ModalBuilder().setCustomId("modal_look
 function buildModal_unblock() { return new ModalBuilder().setCustomId("modal_unblock").setTitle("🔓 Desbloquear IP").addComponents(mkInput("ip_address","IP"),mkInput("key_pass","Senha")); }
 function buildModal_cleanlogs() { return new ModalBuilder().setCustomId("modal_cleanlogs").setTitle("🧹 Limpar Logs").addComponents(mkInput("key_pass","Senha")); }
 
-// ─── !online COMMAND CORRIGIDO ─────────────────────────────────────────────────
 clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
     if (message.content === "!logspanel") await sendLogsPanel();
