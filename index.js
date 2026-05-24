@@ -330,7 +330,7 @@ app.use((req, res, next) => {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Access-Control-Allow-Credentials", "true");
         res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass,x-auth-token");
     }
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
