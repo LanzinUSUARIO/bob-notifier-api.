@@ -560,8 +560,16 @@ app.get("/auth/callback", async (req, res) => {
             { upsert: true, new: true }
         );
 
-        // ── NOVO: gera key automática se o usuário ainda não tiver uma ──
-        await createAutoKeyForUser(discordUser.id, discordUser.username);
+       // ── NOVO: gera key automática se o usuário ainda não tiver uma ──
+        console.log(`[AUTH DEBUG] Iniciando createAutoKey para ${discordUser.id} (${discordUser.username})`);
+        try {
+            const autoKey = await createAutoKeyForUser(discordUser.id, discordUser.username);
+            console.log(`[AUTH DEBUG] createAutoKey retornou: ${autoKey}`);
+            const check = await KeyModel.findOne({ discordId: String(discordUser.id) });
+            console.log(`[AUTH DEBUG] Confirmação no banco:`, check ? `${check.name} isAutoKey=${check.isAutoKey}` : "NÃO ENCONTRADA");
+        } catch(e) {
+            console.error(`[AUTH DEBUG] ERRO em createAutoKey:`, e);
+        }
 
         const token = jwt.sign(
             { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar },
