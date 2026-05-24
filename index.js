@@ -612,42 +612,43 @@ app.get("/auth/me", requireAuth, async (req, res) => {
 });
 
 // ─── ROTA ONLINE ──────────────────────────────────────────────────────────────
-app.get("/api/online", (req, res) => {
+app.get("/api/online", async (req, res) => {
     const now = Date.now();
 
-    // Mapeia quem tem presence ativa (script rodando) para pegar o nome Roblox
     const nameByKey = {};
     for (const [, info] of Object.entries(presence)) {
         if (now - info.lastSeen > ONLINE_STALE_MS) continue;
         const keyName = info.key ? findKey(info.key) : null;
-        if (keyName && !nameByKey[keyName]) {
-            nameByKey[keyName] = info.name || null;
-        }
+        if (keyName && !nameByKey[keyName]) nameByKey[keyName] = info.name || null;
     }
 
-    // Todos com key ativa (não pausada, não sem tempo, não auto-key vazia)
     const onlineUsers = [];
     for (const [keyName, d] of Object.entries(keys)) {
-        if (d.isAutoKey && d.remaining === 0) continue; // sem tempo
+        if (d.isAutoKey && d.remaining === 0) continue;
         if (d.paused) continue;
         if (d.expiry !== Infinity && d.expiry - now <= 0) continue;
 
+        let discordTag = null, discordAvatar = null;
+        if (d.discordId) {
+            const user = await User.findOne({ discordId: d.discordId }).lean();
+            discordTag = user?.discordTag || null;
+            discordAvatar = user?.avatar || null;
+        }
+
         onlineUsers.push({
             keyPrefix: keyName.substring(0, 7) + "***",
-            robloxName: nameByKey[keyName] || "Aguardando...",
-            expiryMs: d.expiry === Infinity ? null : d.expiry - now,
+            robloxName: nameByKey[keyName] || null,
+            discordId: d.discordId || null,
+            discordTag,
+            discordAvatar,
+            expiryMs: d.expiry === Infinity ? null : Math.max(0, d.expiry - now),
             isLifetime: d.expiry === Infinity,
             paused: false,
             serverTime: now,
         });
     }
 
-    res.json({
-        online: onlineUsers,
-        count: onlineUsers.length,
-        maxSlots: MAX_SLOTS,
-        serverTime: now,
-    });
+    res.json({ online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, serverTime: now });
 });
 
 app.post("/api/buy", requireAuth, async (req, res) => {
