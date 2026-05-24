@@ -269,19 +269,45 @@ async function deleteKey(name) {
 
 // ── NOVO: cria uma key "vazia" vinculada ao Discord ID do usuário no login ────
 async function createAutoKeyForUser(discordId, discordTag) {
-    // Verifica se já existe key para esse usuário
-    const existing = Object.entries(keys).find(([, d]) => d.discordId === String(discordId));
-    if (existing) return existing[0]; // já tem, não cria
+    const discordIdStr = String(discordId);
 
+    // Verifica em memória
+    const existing = Object.entries(keys).find(([, d]) => d.discordId === discordIdStr);
+    if (existing) {
+        console.log(`[AUTH] Usuário ${discordTag} já tem key em memória: ${existing[0]}`);
+        return existing[0];
+    }
+
+    // Verifica no banco (caso o servidor tenha reiniciado e não carregado ainda)
+    const existingInDB = await KeyModel.findOne({ discordId: discordIdStr });
+    if (existingInDB) {
+        console.log(`[AUTH] Usuário ${discordTag} já tem key no banco: ${existingInDB.name}`);
+        // Carrega em memória se não estiver
+        if (!keys[existingInDB.name]) {
+            const expiry = existingInDB.expiry >= LIFETIME_VALUE ? Infinity : existingInDB.expiry;
+            const remaining = existingInDB.remaining >= LIFETIME_VALUE ? Infinity : existingInDB.remaining;
+            keys[existingInDB.name] = {
+                expiry, paused: existingInDB.paused, remaining,
+                hwid: existingInDB.hwid || null,
+                discordId: discordIdStr,
+                warnSent: existingInDB.warnSent || false,
+                isAutoKey: existingInDB.isAutoKey || false,
+            };
+            console.log(`[AUTH] Key ${existingInDB.name} carregada do banco para memória.`);
+        }
+        return existingInDB.name;
+    }
+
+    // Cria nova
     const keyName = generateBobKey();
     keys[keyName] = {
-        expiry: 0,          // sem tempo ainda
-        paused: true,       // pausada para não ser deletada pelo cleanup
-        remaining: 0,       // zero minutos
+        expiry: 0,
+        paused: true,
+        remaining: 0,
         hwid: null,
-        discordId: String(discordId),
+        discordId: discordIdStr,
         warnSent: false,
-        isAutoKey: true,    // marca como auto-gerada no login
+        isAutoKey: true,
     };
     await saveKey(keyName);
     console.log(`[AUTH] ✅ Key auto-gerada no login: ${keyName} → ${discordTag}`);
