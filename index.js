@@ -614,27 +614,39 @@ app.get("/auth/me", requireAuth, async (req, res) => {
 // ─── ROTA ONLINE ──────────────────────────────────────────────────────────────
 app.get("/api/online", (req, res) => {
     const now = Date.now();
-    const onlineByKey = {};
+
+    // Mapeia quem tem presence ativa (script rodando) para pegar o nome Roblox
+    const nameByKey = {};
     for (const [, info] of Object.entries(presence)) {
         if (now - info.lastSeen > ONLINE_STALE_MS) continue;
         const keyName = info.key ? findKey(info.key) : null;
-        if (keyName && !onlineByKey[keyName]) {
-            onlineByKey[keyName] = { name: info.name || "Unknown" };
+        if (keyName && !nameByKey[keyName]) {
+            nameByKey[keyName] = info.name || null;
         }
     }
+
+    // Todos com key ativa (não pausada, não sem tempo, não auto-key vazia)
     const onlineUsers = [];
-    for (const [keyName, info] of Object.entries(onlineByKey)) {
-        const d = keys[keyName];
-        if (!d) continue;
+    for (const [keyName, d] of Object.entries(keys)) {
+        if (d.isAutoKey && d.remaining === 0) continue; // sem tempo
+        if (d.paused) continue;
+        if (d.expiry !== Infinity && d.expiry - now <= 0) continue;
+
         onlineUsers.push({
             keyPrefix: keyName.substring(0, 7) + "***",
-            robloxName: info.name,
+            robloxName: nameByKey[keyName] || "Aguardando...",
             expiryMs: d.expiry === Infinity ? null : d.expiry - now,
             isLifetime: d.expiry === Infinity,
-            paused: d.paused,
+            paused: false,
         });
     }
-    res.json({ online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, slotsUsed: onlineUsers.length, slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length), serverTime: now });
+
+    res.json({
+        online: onlineUsers,
+        count: onlineUsers.length,
+        maxSlots: MAX_SLOTS,
+        serverTime: now,
+    });
 });
 
 app.post("/api/buy", requireAuth, async (req, res) => {
