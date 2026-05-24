@@ -86,6 +86,8 @@ const KeySchema = new mongoose.Schema({
     hwid:      { type: String, default: null },
     discordId: { type: String, default: null },
     warnSent:  { type: Boolean, default: false },
+    // ── NOVO: marca keys geradas automaticamente no login (sem tempo ainda) ──
+    isAutoKey: { type: Boolean, default: false },
 });
 const KeyModel = mongoose.model("Key", KeySchema);
 
@@ -238,8 +240,15 @@ async function loadKeys() {
         for (const d of docs) {
             const expiry = d.expiry >= LIFETIME_VALUE ? Infinity : d.expiry;
             const remaining = d.remaining >= LIFETIME_VALUE ? Infinity : d.remaining;
-            if (expiry !== Infinity && expiry - Date.now() <= 0) { await KeyModel.deleteOne({ name: d.name }); expired++; continue; }
-            keys[d.name] = { expiry, paused: d.paused, remaining, hwid: d.hwid || null, discordId: d.discordId || null, warnSent: d.warnSent || false };
+            // ── Não deletar auto-keys (paused=true, expiry=0) — elas são keys "sem tempo"
+            if (expiry !== Infinity && !d.paused && expiry - Date.now() <= 0) {
+                await KeyModel.deleteOne({ name: d.name }); expired++; continue;
+            }
+            keys[d.name] = {
+                expiry, paused: d.paused, remaining, hwid: d.hwid || null,
+                discordId: d.discordId || null, warnSent: d.warnSent || false,
+                isAutoKey: d.isAutoKey || false,
+            };
         }
         console.log(`[DB] ${Object.keys(keys).length} keys carregadas. ${expired} expiradas removidas.`);
     } catch (e) { console.error("[DB] Erro ao carregar keys:", e.message); }
@@ -258,9 +267,33 @@ async function deleteKey(name) {
     try { await KeyModel.deleteOne({ name }); } catch (e) { console.error("[DB] Erro ao deletar key:", e.message); }
 }
 
+// ── NOVO: cria uma key "vazia" vinculada ao Discord ID do usuário no login ────
+async function createAutoKeyForUser(discordId, discordTag) {
+    // Verifica se já existe key para esse usuário
+    const existing = Object.entries(keys).find(([, d]) => d.discordId === String(discordId));
+    if (existing) return existing[0]; // já tem, não cria
+
+    const keyName = generateBobKey();
+    keys[keyName] = {
+        expiry: 0,          // sem tempo ainda
+        paused: true,       // pausada para não ser deletada pelo cleanup
+        remaining: 0,       // zero minutos
+        hwid: null,
+        discordId: String(discordId),
+        warnSent: false,
+        isAutoKey: true,    // marca como auto-gerada no login
+    };
+    await saveKey(keyName);
+    console.log(`[AUTH] ✅ Key auto-gerada no login: ${keyName} → ${discordTag}`);
+    return keyName;
+}
+
 setInterval(async () => {
     const now = Date.now();
     for (const [name, data] of Object.entries(keys)) {
+        // ── Não deletar auto-keys com expiry=0 e paused=true ──
+        if (data.isAutoKey && data.expiry === 0 && data.paused) continue;
+
         if (data.expiry !== Infinity && !data.paused && data.expiry - now <= 0) {
             if (data.discordId) fetchUserFromAnyClient(data.discordId).then(user => {
                 if (user) user.send({ embeds: [new EmbedBuilder().setColor(COLORS.danger).setTitle("⌛ Sua key expirou!").setDescription(`Sua key \`${name}\` expirou. Acesse a loja para renovar!`).setTimestamp()] }).catch(() => {});
@@ -394,35 +427,80 @@ function checkKey(key, secret, hwid) {
     return { ok: true, data, keyName };
 }
 
+// ── CONFIRMAR PAGAMENTO — com suporte a auto-key e soma de horas ─────────────
 async function confirmarPagamento(user, hours, channel, confirmedBy = "admin", price = null, label = null, couponUsed = null) {
     const expiresAt = Date.now() + hours * 3_600_000;
+    const addMs = hours * 3_600_000;
     const existingKeyEntry = Object.entries(keys).find(([, d]) => d.discordId === String(user.id));
+
     if (existingKeyEntry) {
         const [existingName, existingData] = existingKeyEntry;
-        const addMs = hours * 3_600_000;
-        if (existingData.paused) existingData.remaining += addMs;
-        else if (existingData.expiry !== Infinity) existingData.expiry += addMs;
-        existingData.warnSent = false; await saveKey(existingName);
+
+        if (existingData.paused) {
+            // ── CASO 1: auto-key gerada no login (expiry=0, isAutoKey=true)
+            //    → ativar agora com o tempo comprado
+            if (existingData.isAutoKey && existingData.remaining === 0) {
+                existingData.remaining = addMs;
+                existingData.expiry = Date.now() + addMs;
+                existingData.paused = false;
+                existingData.isAutoKey = false; // agora é uma key normal
+            } else {
+                // ── CASO 2: admin pausou manualmente → somar ao remaining (ficará pausada)
+                existingData.remaining += addMs;
+            }
+        } else if (existingData.expiry !== Infinity) {
+            // ── CASO 3: key ativa → somar horas ao expiry
+            existingData.expiry += addMs;
+        }
+        // CASO 4: Lifetime → não muda nada
+
+        existingData.warnSent = false;
+        await saveKey(existingName);
+
         const plan = PLANS.find(p => p.hours === hours);
-        price = price || plan?.price || hours * 5; label = label || plan?.label || `${hours}h`;
-        await SaleHistory.create({ discordId: String(user.id), discordTag: user.tag, hours, price, label, keyName: existingName, couponUsed, confirmedBy: String(confirmedBy) }).catch(() => {});
-        fetchUserFromAnyClient(user.id).then(u => { if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Key Renovada!").setDescription(`Sua key \`${existingName}\` foi renovada!\n**+Tempo:** ${label}\n**Expira:** ${tsRelative(existingData.expiry)}`).setTimestamp()] }).catch(() => {}); }).catch(() => {});
-        if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Renovação").setDescription(`<@${user.id}> — \`${existingName}\` +${label}`).setTimestamp()] }).catch(() => {});
+        price = price || plan?.price || hours * 5;
+        label = label || plan?.label || `${hours}h`;
+
+        await SaleHistory.create({
+            discordId: String(user.id), discordTag: user.tag, hours, price,
+            label, keyName: existingName, couponUsed, confirmedBy: String(confirmedBy),
+        }).catch(() => {});
+
+        fetchUserFromAnyClient(user.id).then(u => {
+            if (!u) return;
+            const timeLeft = existingData.expiry === Infinity ? "Lifetime ♾️" : tsRelative(existingData.expiry);
+            u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success)
+                .setTitle(existingData.isAutoKey === false && existingData.remaining === addMs ? "🎉 Key Ativada!" : "🔄 Key Renovada!")
+                .setDescription(`Sua key \`${existingName}\` foi atualizada!\n**+Tempo:** ${label}\n**Expira:** ${timeLeft}`)
+                .setTimestamp()] }).catch(() => {});
+        }).catch(() => {});
+
+        if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success)
+            .setTitle("🔄 Renovação/Ativação")
+            .setDescription(`<@${user.id}> — \`${existingName}\` +${label}`)
+            .setTimestamp()] }).catch(() => {});
         return;
     }
+
+    // ── Sem key nenhuma → criar uma nova (caso raro após o auto-key do login)
     const keyName = generateBobKey();
     const plan = PLANS.find(p => p.hours === hours);
-    price = price || plan?.price || hours * 5; label = label || plan?.label || `${hours}h`;
-    keys[keyName] = { expiry: expiresAt, paused: false, remaining: hours * 3_600_000, hwid: null, discordId: String(user.id), warnSent: false };
+    price = price || plan?.price || hours * 5;
+    label = label || plan?.label || `${hours}h`;
+    keys[keyName] = { expiry: expiresAt, paused: false, remaining: addMs, hwid: null, discordId: String(user.id), warnSent: false, isAutoKey: false };
     await saveKey(keyName);
+
     await SaleHistory.create({ discordId: String(user.id), discordTag: user.tag, hours, price, label, keyName, couponUsed, confirmedBy: String(confirmedBy) }).catch(() => {});
-    fetchUserFromAnyClient(user.id).then(u => { if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎉 Pagamento Confirmado!").setDescription(`**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${label}\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] }).catch(() => {}); }).catch(() => {});
+
+    fetchUserFromAnyClient(user.id).then(u => {
+        if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎉 Pagamento Confirmado!").setDescription(`**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${label}\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] }).catch(() => {});
+    });
     if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("✅ Key Gerada").setDescription(`<@${user.id}> — \`${keyName}\` — ${label}`).setTimestamp()] }).catch(() => {});
     console.log(`[PAYMENT] ✅ Key gerada: ${keyName} (${hours}h)`);
 }
 
-async function opCreateKey(name, durationMs) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" }; keys[name] = { expiry: Date.now() + durationMs, paused: false, remaining: durationMs, hwid: null, discordId: null, warnSent: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` criada! **${formatTime(durationMs)}**` }; }
-async function opCreateLifetime(name) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null, warnSent: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` Lifetime ♾️` }; }
+async function opCreateKey(name, durationMs) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" }; keys[name] = { expiry: Date.now() + durationMs, paused: false, remaining: durationMs, hwid: null, discordId: null, warnSent: false, isAutoKey: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` criada! **${formatTime(durationMs)}**` }; }
+async function opCreateLifetime(name) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null, warnSent: false, isAutoKey: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` Lifetime ♾️` }; }
 async function opRevokeKey(name) { if (name.toLowerCase() === "all") { const count = Object.keys(keys).length; for (const k of Object.keys(keys)) { delete keys[k]; await deleteKey(k); } return { ok: true, msg: `🗑️ **${count}** removidas.` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; delete keys[t]; await deleteKey(t); return { ok: true, msg: `🗑️ \`${t}\` removida.` }; }
 async function opTogglePause(name) { if (name.toLowerCase() === "all") { let p = 0, r = 0; for (const k of Object.keys(keys)) { const d = keys[k]; if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; r++; } else { d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; p++; } await saveKey(k); } return { ok: true, msg: `⏸️ ${p} pausadas, ${r} retomadas.` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; const d = keys[t]; if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; await saveKey(t); return { ok: true, msg: `▶️ \`${t}\` retomada!` }; } d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; await saveKey(t); return { ok: true, msg: `⏸️ \`${t}\` pausada!` }; }
 async function opResetHwid(name) { if (name.toLowerCase() === "all") { let count = 0; for (const k of Object.keys(keys)) { keys[k].hwid = null; kicked[k.toLowerCase()] = Date.now(); await saveKey(k); count++; } return { ok: true, msg: `✅ HWID de **${count}** resetado!` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; keys[t].hwid = null; kicked[t.toLowerCase()] = Date.now(); await saveKey(t); return { ok: true, msg: `✅ HWID de \`${t}\` resetado!` }; }
@@ -445,13 +523,20 @@ app.get("/auth/callback", async (req, res) => {
         });
         const tokenData = await tokenRes.json();
         if (!tokenData.access_token) return res.redirect(`${FRONTEND_URL}?error=token`);
+
         const userRes = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: `Bearer ${tokenData.access_token}` } });
         const discordUser = await userRes.json();
+
+        // Salva/atualiza usuário no banco
         await User.findOneAndUpdate(
             { discordId: discordUser.id },
             { discordTag: discordUser.username, avatar: discordUser.avatar },
             { upsert: true, new: true }
         );
+
+        // ── NOVO: gera key automática se o usuário ainda não tiver uma ──
+        await createAutoKeyForUser(discordUser.id, discordUser.username);
+
         const token = jwt.sign(
             { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar },
             JWT_SECRET,
@@ -466,23 +551,36 @@ app.get("/auth/logout", (req, res) => { res.json({ ok: true }); });
 app.get("/auth/me", requireAuth, async (req, res) => {
     const user = await User.findOne({ discordId: req.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+
     const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === user.discordId);
-    const keyData = keyEntry ? {
-        name: keyEntry[0],
-        expiry: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry,
-        expiryMs: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry - Date.now(),
-        paused: keyEntry[1].paused,
-        timeLeft: keyEntry[1].expiry === Infinity ? "Lifetime" : formatTime(keyEntry[1].expiry - Date.now())
-    } : null;
+    let keyData = null;
+    if (keyEntry) {
+        const [keyName, kd] = keyEntry;
+        const now = Date.now();
+        // ── isAutoKey=true e remaining=0 → sem tempo (inativo) ──
+        const hasTime = kd.expiry === Infinity || (!kd.paused && kd.expiry - now > 0) || (kd.paused && kd.remaining > 0);
+        keyData = {
+            name: keyName,
+            expiry: kd.expiry === Infinity ? null : kd.expiry,
+            expiryMs: kd.expiry === Infinity ? null : kd.expiry - now,
+            paused: kd.paused,
+            isAutoKey: kd.isAutoKey || false,
+            hasTime,           // ← novo campo para o frontend distinguir ativo/inativo
+            timeLeft: kd.expiry === Infinity
+                ? "Lifetime"
+                : kd.paused
+                    ? formatTime(kd.remaining)
+                    : formatTime(kd.expiry - now),
+        };
+    }
+
     res.json({ discordId: user.discordId, discordTag: user.discordTag, avatar: user.avatar, balance: user.balance, key: keyData, plans: PLANS.filter(p => p.active) });
 });
 
-// ─── ROTA ONLINE (pública) ────────────────────────────────────────────────────
+// ─── ROTA ONLINE ──────────────────────────────────────────────────────────────
 app.get("/api/online", (req, res) => {
     const now = Date.now();
     const onlineByKey = {};
-
-    // Mapeia presença por keyName
     for (const [, info] of Object.entries(presence)) {
         if (now - info.lastSeen > ONLINE_STALE_MS) continue;
         const keyName = info.key ? findKey(info.key) : null;
@@ -490,29 +588,19 @@ app.get("/api/online", (req, res) => {
             onlineByKey[keyName] = { name: info.name || "Unknown" };
         }
     }
-
     const onlineUsers = [];
     for (const [keyName, info] of Object.entries(onlineByKey)) {
         const d = keys[keyName];
         if (!d) continue;
         onlineUsers.push({
-            discordTag: null, // não expor tag por privacidade
-            keyPrefix: keyName.substring(0, 7) + "***", // BOB-XXX***
+            keyPrefix: keyName.substring(0, 7) + "***",
             robloxName: info.name,
             expiryMs: d.expiry === Infinity ? null : d.expiry - now,
             isLifetime: d.expiry === Infinity,
             paused: d.paused,
         });
     }
-
-    res.json({
-        online: onlineUsers,
-        count: onlineUsers.length,
-        maxSlots: MAX_SLOTS,
-        slotsUsed: onlineUsers.length,
-        slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length),
-        serverTime: now,
-    });
+    res.json({ online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, slotsUsed: onlineUsers.length, slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length), serverTime: now });
 });
 
 app.post("/api/buy", requireAuth, async (req, res) => {
@@ -588,7 +676,7 @@ async function sendLogsPanel() {
 function buildOnlineEmbed() {
     const now = Date.now(), robloxByKey = {};
     for (const [, info] of Object.entries(presence)) { const keyName = info.key ? findKey(info.key) : null; if (keyName && !robloxByKey[keyName] && now - info.lastSeen < PRESENCE_TTL) robloxByKey[keyName] = info.name || null; }
-    const activeKeys = Object.entries(keys).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
+    const activeKeys = Object.entries(keys).filter(([, d]) => !d.isAutoKey || d.remaining > 0).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
     const onlineCount = Object.values(robloxByKey).length;
     const embed = new EmbedBuilder().setTitle(`📋 Keys — ${activeKeys.length} | 🟢 ${onlineCount} online`).setColor(onlineCount > 0 ? COLORS.success : COLORS.primary).setTimestamp();
     if (!activeKeys.length) { embed.setDescription("Nenhuma key ativa."); return embed; }
@@ -611,7 +699,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
     if (id === "logs_stoponline") { await interaction.deferReply({ flags: 64 }); stopOnlineInterval(interaction.channelId); await interaction.editReply({ content: "⏹️ Parado." }); return; }
     if (id === "logs_stats") {
         await interaction.deferReply({ flags: 64 });
-        const all = Object.values(keys), active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)), paused = all.filter(k => k.paused), lt = all.filter(k => k.expiry === Infinity), online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
+        const all = Object.values(keys).filter(k => !k.isAutoKey || k.remaining > 0), active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)), paused = all.filter(k => k.paused), lt = all.filter(k => k.expiry === Infinity), online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
         const pendentes = await PendingPayment.countDocuments(), totalVendas = await SaleHistory.aggregate([{ $group: { _id: null, total: { $sum: "$price" } } }]);
         await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("📊 Stats").setColor(COLORS.primary).addFields({ name: "🔑 Total", value: `\`${all.length}\``, inline: true },{ name: "✅ Ativas", value: `\`${active.length}\``, inline: true },{ name: "⏸️ Pausadas", value: `\`${paused.length}\``, inline: true },{ name: "♾️ Lifetime", value: `\`${lt.length}\``, inline: true },{ name: "🟢 Online", value: `\`${online.length}\``, inline: true },{ name: "⏳ Pendentes", value: `\`${pendentes}\``, inline: true },{ name: "💰 Receita", value: `\`R$${totalVendas[0]?.total || 0}\``, inline: true }).setTimestamp()] }); return;
     }
