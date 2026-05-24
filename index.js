@@ -630,9 +630,19 @@ app.get("/api/online", async (req, res) => {
 
         let discordTag = null, discordAvatar = null;
         if (d.discordId) {
-            const user = await User.findOne({ discordId: d.discordId }).lean();
-            discordTag = user?.discordTag || null;
-            discordAvatar = user?.avatar || null;
+            // Tenta banco primeiro
+            const userDb = await User.findOne({ discordId: d.discordId }).lean();
+            discordTag = userDb?.discordTag || null;
+            discordAvatar = userDb?.avatar || null;
+
+            // Fallback: busca pelo bot
+            if (!discordTag) {
+                try {
+                    const discordUser = await fetchUserFromAnyClient(d.discordId);
+                    discordTag = discordUser?.username || discordUser?.tag || null;
+                    discordAvatar = discordUser?.avatar || null;
+                } catch {}
+            }
         }
 
         onlineUsers.push({
