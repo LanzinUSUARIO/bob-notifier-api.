@@ -23,6 +23,7 @@ const RATE_LIMIT_WINDOW  = 60_000;
 const BLOCK_DURATION     = 5  * 60 * 1_000;
 const PENDING_EXPIRY_MS  = 15 * 60 * 1_000;
 const KEY_WARN_BEFORE_MS = 30 * 60 * 1_000;
+const MAX_SLOTS          = parseInt(process.env.MAX_SLOTS || "10");
 
 const COLORS = {
     primary:  0x5865F2, success:  0x00E676, danger:   0xFF3C3C,
@@ -313,7 +314,6 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
     const allowed = [FRONTEND_URL, "http://localhost:3001", "http://localhost:3000"];
     const origin = req.headers.origin;
@@ -338,7 +338,7 @@ async function logSecurityAlert(message) {
 }
 
 function rateLimitMiddleware(req, res, next) {
-    const openRoutes = ["/health", "/", "/dashboard", "/api/dashboard", "/auth/", "/api/admin/", "/api/buy", "/api/transactions", "/auth/me"];
+    const openRoutes = ["/health", "/", "/dashboard", "/api/dashboard", "/auth/", "/api/admin/", "/api/buy", "/api/transactions", "/auth/me", "/api/online"];
     if (openRoutes.some(r => req.path.startsWith(r))) return next();
     const ip = getRealIP(req), now = Date.now();
     if (blockedIPs[ip]) { if (now < blockedIPs[ip]) return res.status(429).json({ status: "error", message: "IP bloqueado." }); delete blockedIPs[ip]; }
@@ -357,7 +357,6 @@ function requireClientHeader(req, res, next) {
 
 app.use(rateLimitMiddleware);
 
-// ─── JWT AUTH ─────────────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
     const authHeader = req.headers["authorization"];
     const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -468,8 +467,52 @@ app.get("/auth/me", requireAuth, async (req, res) => {
     const user = await User.findOne({ discordId: req.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
     const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === user.discordId);
-    const keyData = keyEntry ? { name: keyEntry[0], expiry: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry, paused: keyEntry[1].paused, timeLeft: keyEntry[1].expiry === Infinity ? "Lifetime" : formatTime(keyEntry[1].expiry - Date.now()) } : null;
+    const keyData = keyEntry ? {
+        name: keyEntry[0],
+        expiry: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry,
+        expiryMs: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry - Date.now(),
+        paused: keyEntry[1].paused,
+        timeLeft: keyEntry[1].expiry === Infinity ? "Lifetime" : formatTime(keyEntry[1].expiry - Date.now())
+    } : null;
     res.json({ discordId: user.discordId, discordTag: user.discordTag, avatar: user.avatar, balance: user.balance, key: keyData, plans: PLANS.filter(p => p.active) });
+});
+
+// ─── ROTA ONLINE (pública) ────────────────────────────────────────────────────
+app.get("/api/online", (req, res) => {
+    const now = Date.now();
+    const onlineByKey = {};
+
+    // Mapeia presença por keyName
+    for (const [, info] of Object.entries(presence)) {
+        if (now - info.lastSeen > ONLINE_STALE_MS) continue;
+        const keyName = info.key ? findKey(info.key) : null;
+        if (keyName && !onlineByKey[keyName]) {
+            onlineByKey[keyName] = { name: info.name || "Unknown" };
+        }
+    }
+
+    const onlineUsers = [];
+    for (const [keyName, info] of Object.entries(onlineByKey)) {
+        const d = keys[keyName];
+        if (!d) continue;
+        onlineUsers.push({
+            discordTag: null, // não expor tag por privacidade
+            keyPrefix: keyName.substring(0, 7) + "***", // BOB-XXX***
+            robloxName: info.name,
+            expiryMs: d.expiry === Infinity ? null : d.expiry - now,
+            isLifetime: d.expiry === Infinity,
+            paused: d.paused,
+        });
+    }
+
+    res.json({
+        online: onlineUsers,
+        count: onlineUsers.length,
+        maxSlots: MAX_SLOTS,
+        slotsUsed: onlineUsers.length,
+        slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length),
+        serverTime: now,
+    });
 });
 
 app.post("/api/buy", requireAuth, async (req, res) => {
@@ -497,6 +540,13 @@ app.post("/api/admin/balance", requireAdminAuth, async (req, res) => {
     if (!user) return res.status(404).json({ error: "Usuário não encontrado. Peça para ele logar primeiro." });
     await Transaction.create({ discordId, type: "deposit", amount: Number(amount), description: description || "Depósito admin" });
     res.json({ ok: true, newBalance: user.balance, discordTag: user.discordTag });
+});
+
+app.post("/api/admin/slots", requireAdminAuth, async (req, res) => {
+    const { maxSlots } = req.body;
+    if (!maxSlots || isNaN(maxSlots) || maxSlots < 1) return res.status(400).json({ error: "Valor inválido" });
+    process.env.MAX_SLOTS = String(maxSlots);
+    res.json({ ok: true, maxSlots: parseInt(maxSlots) });
 });
 
 app.get("/api/admin/users", requireAdminAuth, async (req, res) => {
@@ -627,10 +677,7 @@ clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
     if (message.content === "!logspanel") await sendLogsPanel();
     if (message.content === "!online") {
-        try {
-            const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] });
-            startOnlineInterval(message.channel.id, msg);
-        } catch (e) { console.error("[!online]", e.message); }
+        try { const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] }); startOnlineInterval(message.channel.id, msg); } catch (e) { console.error("[!online]", e.message); }
     }
 });
 
