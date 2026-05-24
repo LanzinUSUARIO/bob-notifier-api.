@@ -3,7 +3,7 @@ const express  = require("express");
 const http     = require("http");
 const crypto   = require("crypto");
 const path     = require("path");
-const jwt      = require("jsonwebtoken");
+const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const {
     Client, GatewayIntentBits,
@@ -23,7 +23,6 @@ const RATE_LIMIT_WINDOW  = 60_000;
 const BLOCK_DURATION     = 5  * 60 * 1_000;
 const PENDING_EXPIRY_MS  = 15 * 60 * 1_000;
 const KEY_WARN_BEFORE_MS = 30 * 60 * 1_000;
-const MAX_SLOTS          = parseInt(process.env.MAX_SLOTS || "10");
 
 const COLORS = {
     primary:  0x5865F2, success:  0x00E676, danger:   0xFF3C3C,
@@ -43,7 +42,6 @@ const ADMIN_PASS    = requireEnv("ADMIN_PASS");
 const SCRIPT_SECRET = requireEnv("SCRIPT_SECRET");
 const XOR_KEY       = requireEnv("XOR_KEY");
 const MONGODB_URI   = requireEnv("MONGODB_URI");
-const JWT_SECRET    = process.env.JWT_SECRET || "bobjoiner_jwt_secret_2026";
 
 const CLIENT_HEADER          = process.env.CLIENT_HEADER           || "BobJoiner-v2";
 const PIX_KEY                = process.env.PIX_KEY                 || "";
@@ -61,6 +59,7 @@ const SCRIPT_URL             = process.env.SCRIPT_URL              || "";
 const FRONTEND_URL           = process.env.FRONTEND_URL            || "http://localhost:3001";
 const DISCORD_CLIENT_ID      = process.env.DISCORD_CLIENT_ID       || "";
 const DISCORD_CLIENT_SECRET  = process.env.DISCORD_CLIENT_SECRET   || "";
+const JWT_SECRET             = process.env.JWT_SECRET              || "bobsecret_jwt";
 const REDIRECT_URI           = `${process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : "http://localhost:3000"}/auth/callback`;
 
 const ADMIN_ROLE_IDS = ["1477885793144930496","1501356382677373101","1477885797553148066"];
@@ -86,8 +85,6 @@ const KeySchema = new mongoose.Schema({
     hwid:      { type: String, default: null },
     discordId: { type: String, default: null },
     warnSent:  { type: Boolean, default: false },
-    // ── NOVO: marca keys geradas automaticamente no login (sem tempo ainda) ──
-    isAutoKey: { type: Boolean, default: false },
 });
 const KeyModel = mongoose.model("Key", KeySchema);
 
@@ -240,15 +237,8 @@ async function loadKeys() {
         for (const d of docs) {
             const expiry = d.expiry >= LIFETIME_VALUE ? Infinity : d.expiry;
             const remaining = d.remaining >= LIFETIME_VALUE ? Infinity : d.remaining;
-            // ── Não deletar auto-keys (paused=true, expiry=0) — elas são keys "sem tempo"
-            if (expiry !== Infinity && !d.paused && expiry - Date.now() <= 0) {
-                await KeyModel.deleteOne({ name: d.name }); expired++; continue;
-            }
-            keys[d.name] = {
-                expiry, paused: d.paused, remaining, hwid: d.hwid || null,
-                discordId: d.discordId || null, warnSent: d.warnSent || false,
-                isAutoKey: d.isAutoKey || false,
-            };
+            if (expiry !== Infinity && expiry - Date.now() <= 0) { await KeyModel.deleteOne({ name: d.name }); expired++; continue; }
+            keys[d.name] = { expiry, paused: d.paused, remaining, hwid: d.hwid || null, discordId: d.discordId || null, warnSent: d.warnSent || false };
         }
         console.log(`[DB] ${Object.keys(keys).length} keys carregadas. ${expired} expiradas removidas.`);
     } catch (e) { console.error("[DB] Erro ao carregar keys:", e.message); }
@@ -267,59 +257,9 @@ async function deleteKey(name) {
     try { await KeyModel.deleteOne({ name }); } catch (e) { console.error("[DB] Erro ao deletar key:", e.message); }
 }
 
-// ── NOVO: cria uma key "vazia" vinculada ao Discord ID do usuário no login ────
-async function createAutoKeyForUser(discordId, discordTag) {
-    const discordIdStr = String(discordId);
-
-    // Verifica em memória
-    const existing = Object.entries(keys).find(([, d]) => d.discordId === discordIdStr);
-    if (existing) {
-        console.log(`[AUTH] Usuário ${discordTag} já tem key em memória: ${existing[0]}`);
-        return existing[0];
-    }
-
-    // Verifica no banco (caso o servidor tenha reiniciado e não carregado ainda)
-    const existingInDB = await KeyModel.findOne({ discordId: discordIdStr });
-    if (existingInDB) {
-        console.log(`[AUTH] Usuário ${discordTag} já tem key no banco: ${existingInDB.name}`);
-        // Carrega em memória se não estiver
-        if (!keys[existingInDB.name]) {
-            const expiry = existingInDB.expiry >= LIFETIME_VALUE ? Infinity : existingInDB.expiry;
-            const remaining = existingInDB.remaining >= LIFETIME_VALUE ? Infinity : existingInDB.remaining;
-            keys[existingInDB.name] = {
-                expiry, paused: existingInDB.paused, remaining,
-                hwid: existingInDB.hwid || null,
-                discordId: discordIdStr,
-                warnSent: existingInDB.warnSent || false,
-                isAutoKey: existingInDB.isAutoKey || false,
-            };
-            console.log(`[AUTH] Key ${existingInDB.name} carregada do banco para memória.`);
-        }
-        return existingInDB.name;
-    }
-
-    // Cria nova
-    const keyName = generateBobKey();
-    keys[keyName] = {
-        expiry: 0,
-        paused: true,
-        remaining: 0,
-        hwid: null,
-        discordId: discordIdStr,
-        warnSent: false,
-        isAutoKey: true,
-    };
-    await saveKey(keyName);
-    console.log(`[AUTH] ✅ Key auto-gerada no login: ${keyName} → ${discordTag}`);
-    return keyName;
-}
-
 setInterval(async () => {
     const now = Date.now();
     for (const [name, data] of Object.entries(keys)) {
-        // ── Não deletar auto-keys com expiry=0 e paused=true ──
-        if (data.isAutoKey && data.expiry === 0 && data.paused) continue;
-
         if (data.expiry !== Infinity && !data.paused && data.expiry - now <= 0) {
             if (data.discordId) fetchUserFromAnyClient(data.discordId).then(user => {
                 if (user) user.send({ embeds: [new EmbedBuilder().setColor(COLORS.danger).setTitle("⌛ Sua key expirou!").setDescription(`Sua key \`${name}\` expirou. Acesse a loja para renovar!`).setTimestamp()] }).catch(() => {});
@@ -373,6 +313,16 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
+// ─── JWT AUTH ─────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    const token = req.headers["x-auth-token"];
+    if (token) {
+        try { req.jwtUser = jwt.verify(token, JWT_SECRET); } catch { req.jwtUser = null; }
+    } else { req.jwtUser = null; }
+    req.session = { user: req.jwtUser };
+    next();
+});
+
 app.use((req, res, next) => {
     const allowed = [FRONTEND_URL, "http://localhost:3001", "http://localhost:3000"];
     const origin = req.headers.origin;
@@ -380,7 +330,7 @@ app.use((req, res, next) => {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Access-Control-Allow-Credentials", "true");
         res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass,Authorization");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass");
     }
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
@@ -397,7 +347,7 @@ async function logSecurityAlert(message) {
 }
 
 function rateLimitMiddleware(req, res, next) {
-    const openRoutes = ["/health", "/", "/dashboard", "/api/dashboard", "/auth/", "/api/admin/", "/api/buy", "/api/transactions", "/auth/me", "/api/online"];
+    const openRoutes = ["/health", "/", "/dashboard", "/api/dashboard", "/auth/", "/api/admin/", "/api/buy", "/api/transactions", "/auth/me"];
     if (openRoutes.some(r => req.path.startsWith(r))) return next();
     const ip = getRealIP(req), now = Date.now();
     if (blockedIPs[ip]) { if (now < blockedIPs[ip]) return res.status(429).json({ status: "error", message: "IP bloqueado." }); delete blockedIPs[ip]; }
@@ -416,18 +366,7 @@ function requireClientHeader(req, res, next) {
 
 app.use(rateLimitMiddleware);
 
-function requireAuth(req, res, next) {
-    const authHeader = req.headers["authorization"];
-    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (!token) return res.status(401).json({ error: "Não autenticado" });
-    try {
-        req.user = jwt.verify(token, JWT_SECRET);
-        next();
-    } catch (e) {
-        return res.status(401).json({ error: "Token inválido ou expirado" });
-    }
-}
-
+function requireAuth(req, res, next) { if (!req.session?.user) return res.status(401).json({ error: "Não autenticado" }); next(); }
 function requireAdminAuth(req, res, next) { const pass = req.headers["x-admin-pass"] || req.query.pass; if (!safeCompare(pass, ADMIN_PASS)) return res.status(401).json({ error: "Sem permissão" }); next(); }
 
 io.use((socket, next) => {
@@ -453,80 +392,35 @@ function checkKey(key, secret, hwid) {
     return { ok: true, data, keyName };
 }
 
-// ── CONFIRMAR PAGAMENTO — com suporte a auto-key e soma de horas ─────────────
 async function confirmarPagamento(user, hours, channel, confirmedBy = "admin", price = null, label = null, couponUsed = null) {
     const expiresAt = Date.now() + hours * 3_600_000;
-    const addMs = hours * 3_600_000;
     const existingKeyEntry = Object.entries(keys).find(([, d]) => d.discordId === String(user.id));
-
     if (existingKeyEntry) {
         const [existingName, existingData] = existingKeyEntry;
-
-        if (existingData.paused) {
-            // ── CASO 1: auto-key gerada no login (expiry=0, isAutoKey=true)
-            //    → ativar agora com o tempo comprado
-            if (existingData.isAutoKey && existingData.remaining === 0) {
-                existingData.remaining = addMs;
-                existingData.expiry = Date.now() + addMs;
-                existingData.paused = false;
-                existingData.isAutoKey = false; // agora é uma key normal
-            } else {
-                // ── CASO 2: admin pausou manualmente → somar ao remaining (ficará pausada)
-                existingData.remaining += addMs;
-            }
-        } else if (existingData.expiry !== Infinity) {
-            // ── CASO 3: key ativa → somar horas ao expiry
-            existingData.expiry += addMs;
-        }
-        // CASO 4: Lifetime → não muda nada
-
-        existingData.warnSent = false;
-        await saveKey(existingName);
-
+        const addMs = hours * 3_600_000;
+        if (existingData.paused) existingData.remaining += addMs;
+        else if (existingData.expiry !== Infinity) existingData.expiry += addMs;
+        existingData.warnSent = false; await saveKey(existingName);
         const plan = PLANS.find(p => p.hours === hours);
-        price = price || plan?.price || hours * 5;
-        label = label || plan?.label || `${hours}h`;
-
-        await SaleHistory.create({
-            discordId: String(user.id), discordTag: user.tag, hours, price,
-            label, keyName: existingName, couponUsed, confirmedBy: String(confirmedBy),
-        }).catch(() => {});
-
-        fetchUserFromAnyClient(user.id).then(u => {
-            if (!u) return;
-            const timeLeft = existingData.expiry === Infinity ? "Lifetime ♾️" : tsRelative(existingData.expiry);
-            u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success)
-                .setTitle(existingData.isAutoKey === false && existingData.remaining === addMs ? "🎉 Key Ativada!" : "🔄 Key Renovada!")
-                .setDescription(`Sua key \`${existingName}\` foi atualizada!\n**+Tempo:** ${label}\n**Expira:** ${timeLeft}`)
-                .setTimestamp()] }).catch(() => {});
-        }).catch(() => {});
-
-        if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success)
-            .setTitle("🔄 Renovação/Ativação")
-            .setDescription(`<@${user.id}> — \`${existingName}\` +${label}`)
-            .setTimestamp()] }).catch(() => {});
+        price = price || plan?.price || hours * 5; label = label || plan?.label || `${hours}h`;
+        await SaleHistory.create({ discordId: String(user.id), discordTag: user.tag, hours, price, label, keyName: existingName, couponUsed, confirmedBy: String(confirmedBy) }).catch(() => {});
+        fetchUserFromAnyClient(user.id).then(u => { if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Key Renovada!").setDescription(`Sua key \`${existingName}\` foi renovada!\n**+Tempo:** ${label}\n**Expira:** ${tsRelative(existingData.expiry)}`).setTimestamp()] }).catch(() => {}); }).catch(() => {});
+        if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Renovação").setDescription(`<@${user.id}> — \`${existingName}\` +${label}`).setTimestamp()] }).catch(() => {});
         return;
     }
-
-    // ── Sem key nenhuma → criar uma nova (caso raro após o auto-key do login)
     const keyName = generateBobKey();
     const plan = PLANS.find(p => p.hours === hours);
-    price = price || plan?.price || hours * 5;
-    label = label || plan?.label || `${hours}h`;
-    keys[keyName] = { expiry: expiresAt, paused: false, remaining: addMs, hwid: null, discordId: String(user.id), warnSent: false, isAutoKey: false };
+    price = price || plan?.price || hours * 5; label = label || plan?.label || `${hours}h`;
+    keys[keyName] = { expiry: expiresAt, paused: false, remaining: hours * 3_600_000, hwid: null, discordId: String(user.id), warnSent: false };
     await saveKey(keyName);
-
     await SaleHistory.create({ discordId: String(user.id), discordTag: user.tag, hours, price, label, keyName, couponUsed, confirmedBy: String(confirmedBy) }).catch(() => {});
-
-    fetchUserFromAnyClient(user.id).then(u => {
-        if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎉 Pagamento Confirmado!").setDescription(`**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${label}\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] }).catch(() => {});
-    });
+    fetchUserFromAnyClient(user.id).then(u => { if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎉 Pagamento Confirmado!").setDescription(`**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${label}\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] }).catch(() => {}); }).catch(() => {});
     if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("✅ Key Gerada").setDescription(`<@${user.id}> — \`${keyName}\` — ${label}`).setTimestamp()] }).catch(() => {});
     console.log(`[PAYMENT] ✅ Key gerada: ${keyName} (${hours}h)`);
 }
 
-async function opCreateKey(name, durationMs) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" }; keys[name] = { expiry: Date.now() + durationMs, paused: false, remaining: durationMs, hwid: null, discordId: null, warnSent: false, isAutoKey: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` criada! **${formatTime(durationMs)}**` }; }
-async function opCreateLifetime(name) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null, warnSent: false, isAutoKey: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` Lifetime ♾️` }; }
+async function opCreateKey(name, durationMs) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" }; keys[name] = { expiry: Date.now() + durationMs, paused: false, remaining: durationMs, hwid: null, discordId: null, warnSent: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` criada! **${formatTime(durationMs)}**` }; }
+async function opCreateLifetime(name) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null, warnSent: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` Lifetime ♾️` }; }
 async function opRevokeKey(name) { if (name.toLowerCase() === "all") { const count = Object.keys(keys).length; for (const k of Object.keys(keys)) { delete keys[k]; await deleteKey(k); } return { ok: true, msg: `🗑️ **${count}** removidas.` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; delete keys[t]; await deleteKey(t); return { ok: true, msg: `🗑️ \`${t}\` removida.` }; }
 async function opTogglePause(name) { if (name.toLowerCase() === "all") { let p = 0, r = 0; for (const k of Object.keys(keys)) { const d = keys[k]; if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; r++; } else { d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; p++; } await saveKey(k); } return { ok: true, msg: `⏸️ ${p} pausadas, ${r} retomadas.` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; const d = keys[t]; if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; await saveKey(t); return { ok: true, msg: `▶️ \`${t}\` retomada!` }; } d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; await saveKey(t); return { ok: true, msg: `⏸️ \`${t}\` pausada!` }; }
 async function opResetHwid(name) { if (name.toLowerCase() === "all") { let count = 0; for (const k of Object.keys(keys)) { keys[k].hwid = null; kicked[k.toLowerCase()] = Date.now(); await saveKey(k); count++; } return { ok: true, msg: `✅ HWID de **${count}** resetado!` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; keys[t].hwid = null; kicked[t.toLowerCase()] = Date.now(); await saveKey(t); return { ok: true, msg: `✅ HWID de \`${t}\` resetado!` }; }
@@ -549,33 +443,10 @@ app.get("/auth/callback", async (req, res) => {
         });
         const tokenData = await tokenRes.json();
         if (!tokenData.access_token) return res.redirect(`${FRONTEND_URL}?error=token`);
-
         const userRes = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: `Bearer ${tokenData.access_token}` } });
         const discordUser = await userRes.json();
-
-        // Salva/atualiza usuário no banco
-        await User.findOneAndUpdate(
-            { discordId: discordUser.id },
-            { discordTag: discordUser.username, avatar: discordUser.avatar },
-            { upsert: true, new: true }
-        );
-
-       // ── NOVO: gera key automática se o usuário ainda não tiver uma ──
-        console.log(`[AUTH DEBUG] Iniciando createAutoKey para ${discordUser.id} (${discordUser.username})`);
-        try {
-            const autoKey = await createAutoKeyForUser(discordUser.id, discordUser.username);
-            console.log(`[AUTH DEBUG] createAutoKey retornou: ${autoKey}`);
-            const check = await KeyModel.findOne({ discordId: String(discordUser.id) });
-            console.log(`[AUTH DEBUG] Confirmação no banco:`, check ? `${check.name} isAutoKey=${check.isAutoKey}` : "NÃO ENCONTRADA");
-        } catch(e) {
-            console.error(`[AUTH DEBUG] ERRO em createAutoKey:`, e);
-        }
-
-        const token = jwt.sign(
-            { discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar },
-            JWT_SECRET,
-            { expiresIn: "7d" }
-        );
+        await User.findOneAndUpdate({ discordId: discordUser.id }, { discordTag: discordUser.username, avatar: discordUser.avatar }, { upsert: true, new: true });
+        const token = jwt.sign({ discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar }, JWT_SECRET, { expiresIn: "7d" });
         res.redirect(`${FRONTEND_URL}/?token=${token}`);
     } catch (e) { console.error("[AUTH]", e.message); res.redirect(`${FRONTEND_URL}?error=auth_failed`); }
 });
@@ -583,89 +454,18 @@ app.get("/auth/callback", async (req, res) => {
 app.get("/auth/logout", (req, res) => { res.json({ ok: true }); });
 
 app.get("/auth/me", requireAuth, async (req, res) => {
-    const user = await User.findOne({ discordId: req.user.discordId });
+    const user = await User.findOne({ discordId: req.session.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
-
     const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === user.discordId);
-    let keyData = null;
-    if (keyEntry) {
-        const [keyName, kd] = keyEntry;
-        const now = Date.now();
-        // ── isAutoKey=true e remaining=0 → sem tempo (inativo) ──
-        const hasTime = kd.expiry === Infinity || (!kd.paused && kd.expiry - now > 0) || (kd.paused && kd.remaining > 0);
-        keyData = {
-            name: keyName,
-            expiry: kd.expiry === Infinity ? null : kd.expiry,
-            expiryMs: kd.expiry === Infinity ? null : kd.expiry - now,
-            paused: kd.paused,
-            isAutoKey: kd.isAutoKey || false,
-            hasTime,           // ← novo campo para o frontend distinguir ativo/inativo
-            timeLeft: kd.expiry === Infinity
-                ? "Lifetime"
-                : kd.paused
-                    ? formatTime(kd.remaining)
-                    : formatTime(kd.expiry - now),
-        };
-    }
-
+    const keyData = keyEntry ? { name: keyEntry[0], expiry: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry, paused: keyEntry[1].paused, timeLeft: keyEntry[1].expiry === Infinity ? "Lifetime" : formatTime(keyEntry[1].expiry - Date.now()) } : null;
     res.json({ discordId: user.discordId, discordTag: user.discordTag, avatar: user.avatar, balance: user.balance, key: keyData, plans: PLANS.filter(p => p.active) });
-});
-
-// ─── ROTA ONLINE ──────────────────────────────────────────────────────────────
-app.get("/api/online", async (req, res) => {
-    const now = Date.now();
-
-    const nameByKey = {};
-    for (const [, info] of Object.entries(presence)) {
-        if (now - info.lastSeen > ONLINE_STALE_MS) continue;
-        const keyName = info.key ? findKey(info.key) : null;
-        if (keyName && !nameByKey[keyName]) nameByKey[keyName] = info.name || null;
-    }
-
-    const onlineUsers = [];
-    for (const [keyName, d] of Object.entries(keys)) {
-        if (d.isAutoKey && d.remaining === 0) continue;
-        if (d.paused) continue;
-        if (d.expiry !== Infinity && d.expiry - now <= 0) continue;
-
-        let discordTag = null, discordAvatar = null;
-        if (d.discordId) {
-            // Tenta banco primeiro
-            const userDb = await User.findOne({ discordId: d.discordId }).lean();
-            discordTag = userDb?.discordTag || null;
-            discordAvatar = userDb?.avatar || null;
-
-            // Fallback: busca pelo bot
-            if (!discordTag) {
-                try {
-                    const discordUser = await fetchUserFromAnyClient(d.discordId);
-                    discordTag = discordUser?.username || discordUser?.tag || null;
-                    discordAvatar = discordUser?.avatar || null;
-                } catch {}
-            }
-        }
-
-        onlineUsers.push({
-            keyPrefix: keyName.substring(0, 7) + "***",
-            robloxName: nameByKey[keyName] || null,
-            discordId: d.discordId || null,
-            discordTag,
-            discordAvatar,
-            expiryMs: d.expiry === Infinity ? null : Math.max(0, d.expiry - now),
-            isLifetime: d.expiry === Infinity,
-            paused: false,
-            serverTime: now,
-        });
-    }
-
-    res.json({ online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, serverTime: now });
 });
 
 app.post("/api/buy", requireAuth, async (req, res) => {
     const { planValue } = req.body;
     const plan = PLANS.find(p => p.value === planValue && p.active);
     if (!plan) return res.status(400).json({ error: "Plano inválido" });
-    const user = await User.findOne({ discordId: req.user.discordId });
+    const user = await User.findOne({ discordId: req.session.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
     if (user.balance < plan.price) return res.status(400).json({ error: "Saldo insuficiente" });
     user.balance -= plan.price; await user.save();
@@ -674,8 +474,21 @@ app.post("/api/buy", requireAuth, async (req, res) => {
     res.json({ ok: true, newBalance: user.balance, plan: plan.label });
 });
 
+app.post("/api/buy-midlights", requireAuth, async (req, res) => {
+    const { hours } = req.body;
+    if (!hours || hours < 1) return res.status(400).json({ error: "Horas inválidas" });
+    const price = hours * 5;
+    const user = await User.findOne({ discordId: req.session.user.discordId });
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+    if (user.balance < price) return res.status(400).json({ error: "Saldo insuficiente" });
+    user.balance -= price; await user.save();
+    await confirmarPagamento({ id: user.discordId, tag: user.discordTag }, hours, null, "auto", price, `Midlights ${hours}h`, null);
+    await Transaction.create({ discordId: user.discordId, type: "purchase", amount: -price, description: `Midlights: ${hours}h` });
+    res.json({ ok: true, newBalance: user.balance });
+});
+
 app.get("/api/transactions", requireAuth, async (req, res) => {
-    const transactions = await Transaction.find({ discordId: req.user.discordId }).sort({ createdAt: -1 }).limit(20);
+    const transactions = await Transaction.find({ discordId: req.session.user.discordId }).sort({ createdAt: -1 }).limit(20);
     res.json(transactions);
 });
 
@@ -686,13 +499,6 @@ app.post("/api/admin/balance", requireAdminAuth, async (req, res) => {
     if (!user) return res.status(404).json({ error: "Usuário não encontrado. Peça para ele logar primeiro." });
     await Transaction.create({ discordId, type: "deposit", amount: Number(amount), description: description || "Depósito admin" });
     res.json({ ok: true, newBalance: user.balance, discordTag: user.discordTag });
-});
-
-app.post("/api/admin/slots", requireAdminAuth, async (req, res) => {
-    const { maxSlots } = req.body;
-    if (!maxSlots || isNaN(maxSlots) || maxSlots < 1) return res.status(400).json({ error: "Valor inválido" });
-    process.env.MAX_SLOTS = String(maxSlots);
-    res.json({ ok: true, maxSlots: parseInt(maxSlots) });
 });
 
 app.get("/api/admin/users", requireAdminAuth, async (req, res) => {
@@ -734,7 +540,7 @@ async function sendLogsPanel() {
 function buildOnlineEmbed() {
     const now = Date.now(), robloxByKey = {};
     for (const [, info] of Object.entries(presence)) { const keyName = info.key ? findKey(info.key) : null; if (keyName && !robloxByKey[keyName] && now - info.lastSeen < PRESENCE_TTL) robloxByKey[keyName] = info.name || null; }
-    const activeKeys = Object.entries(keys).filter(([, d]) => !d.isAutoKey || d.remaining > 0).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
+    const activeKeys = Object.entries(keys).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
     const onlineCount = Object.values(robloxByKey).length;
     const embed = new EmbedBuilder().setTitle(`📋 Keys — ${activeKeys.length} | 🟢 ${onlineCount} online`).setColor(onlineCount > 0 ? COLORS.success : COLORS.primary).setTimestamp();
     if (!activeKeys.length) { embed.setDescription("Nenhuma key ativa."); return embed; }
@@ -757,7 +563,7 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
     if (id === "logs_stoponline") { await interaction.deferReply({ flags: 64 }); stopOnlineInterval(interaction.channelId); await interaction.editReply({ content: "⏹️ Parado." }); return; }
     if (id === "logs_stats") {
         await interaction.deferReply({ flags: 64 });
-        const all = Object.values(keys).filter(k => !k.isAutoKey || k.remaining > 0), active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)), paused = all.filter(k => k.paused), lt = all.filter(k => k.expiry === Infinity), online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
+        const all = Object.values(keys), active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)), paused = all.filter(k => k.paused), lt = all.filter(k => k.expiry === Infinity), online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
         const pendentes = await PendingPayment.countDocuments(), totalVendas = await SaleHistory.aggregate([{ $group: { _id: null, total: { $sum: "$price" } } }]);
         await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("📊 Stats").setColor(COLORS.primary).addFields({ name: "🔑 Total", value: `\`${all.length}\``, inline: true },{ name: "✅ Ativas", value: `\`${active.length}\``, inline: true },{ name: "⏸️ Pausadas", value: `\`${paused.length}\``, inline: true },{ name: "♾️ Lifetime", value: `\`${lt.length}\``, inline: true },{ name: "🟢 Online", value: `\`${online.length}\``, inline: true },{ name: "⏳ Pendentes", value: `\`${pendentes}\``, inline: true },{ name: "💰 Receita", value: `\`R$${totalVendas[0]?.total || 0}\``, inline: true }).setTimestamp()] }); return;
     }
@@ -823,7 +629,10 @@ clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
     if (message.content === "!logspanel") await sendLogsPanel();
     if (message.content === "!online") {
-        try { const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] }); startOnlineInterval(message.channel.id, msg); } catch (e) { console.error("[!online]", e.message); }
+        try {
+            const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] });
+            startOnlineInterval(message.channel.id, msg);
+        } catch (e) { console.error("[!online]", e.message); }
     }
 });
 
