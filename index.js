@@ -638,6 +638,7 @@ app.get("/api/online", (req, res) => {
             expiryMs: d.expiry === Infinity ? null : d.expiry - now,
             isLifetime: d.expiry === Infinity,
             paused: false,
+            serverTime: now,
         });
     }
 
