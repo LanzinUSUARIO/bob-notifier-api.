@@ -195,6 +195,37 @@ function pushBrainrot(payload) {
     io.emit("brainrot", payload);
 }
 
+// ─── EMIT ONLINE UPDATE (tempo real para o dashboard) ────────────────────────
+function emitOnlineUpdate() {
+    const now = Date.now();
+    const onlineByKey = {};
+    for (const [, info] of Object.entries(presence)) {
+        if (now - info.lastSeen > ONLINE_STALE_MS) continue;
+        const keyName = info.key ? findKey(info.key) : null;
+        if (keyName && !onlineByKey[keyName]) onlineByKey[keyName] = { name: info.name || "Unknown" };
+    }
+    const onlineUsers = [];
+    for (const [keyName, info] of Object.entries(onlineByKey)) {
+        const d = keys[keyName];
+        if (!d) continue;
+        onlineUsers.push({
+            keyPrefix: keyName.substring(0, 7) + "***",
+            robloxName: info.name,
+            expiryMs: d.expiry === Infinity ? null : d.expiry - now,
+            isLifetime: d.expiry === Infinity,
+            paused: d.paused,
+        });
+    }
+    io.emit("online_update", {
+        online: onlineUsers,
+        count: onlineUsers.length,
+        maxSlots: MAX_SLOTS,
+        slotsUsed: onlineUsers.length,
+        slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length),
+        serverTime: now
+    });
+}
+
 async function fetchUserFromAnyClient(userId) {
     for (const client of [clientLogs, clientPayment, clientPanel, clientNotifier]) {
         try { const u = await client.users.fetch(userId); if (u) return u; } catch {}
@@ -308,6 +339,8 @@ setInterval(async () => {
         }
     }
     for (const [sid, info] of Object.entries(presence)) { if (now - info.lastSeen > PRESENCE_TTL) delete presence[sid]; }
+    // Emit após limpeza
+    emitOnlineUpdate();
     const jobKeys = Object.keys(userJobIds);
     if (jobKeys.length > JOBID_MAX) jobKeys.slice(0, jobKeys.length - JOBID_MAX).forEach(k => delete userJobIds[k]);
 }, 60_000);
@@ -406,17 +439,41 @@ function requireAuth(req, res, next) {
 
 function requireAdminAuth(req, res, next) { const pass = req.headers["x-admin-pass"] || req.query.pass; if (!safeCompare(pass, ADMIN_PASS)) return res.status(401).json({ error: "Sem permissão" }); next(); }
 
+// ─── SOCKET.IO MIDDLEWARE (permite viewer do dashboard sem key) ───────────────
 io.use((socket, next) => {
-    const key = socket.handshake.auth?.key || socket.handshake.query?.key;
+    const isViewer = socket.handshake.auth?.viewer === "dashboard";
+    if (isViewer) { socket.isViewer = true; return next(); }
+
+    const key    = socket.handshake.auth?.key    || socket.handshake.query?.key;
     const secret = socket.handshake.auth?.secret || socket.handshake.query?.secret;
-    const hwid = socket.handshake.auth?.hwid || socket.handshake.query?.hwid;
+    const hwid   = socket.handshake.auth?.hwid   || socket.handshake.query?.hwid;
     const header = socket.handshake.headers?.["x-bob-client"];
     if (!header || header !== CLIENT_HEADER) return next(new Error("Acesso negado."));
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return next(new Error(r.error));
     socket.keyName = r.keyName; next();
 });
-io.on("connection", (socket) => { socket.on("disconnect", () => console.log(`[SOCKET] DC: ${socket.keyName}`)); });
+
+io.on("connection", (socket) => {
+    if (socket.isViewer) {
+        // Manda o estado atual imediatamente para o dashboard que acabou de conectar
+        const now = Date.now();
+        const onlineByKey = {};
+        for (const [, info] of Object.entries(presence)) {
+            if (now - info.lastSeen > ONLINE_STALE_MS) continue;
+            const keyName = info.key ? findKey(info.key) : null;
+            if (keyName && !onlineByKey[keyName]) onlineByKey[keyName] = { name: info.name || "Unknown" };
+        }
+        const onlineUsers = [];
+        for (const [keyName, info] of Object.entries(onlineByKey)) {
+            const d = keys[keyName]; if (!d) continue;
+            onlineUsers.push({ keyPrefix: keyName.substring(0,7)+"***", robloxName: info.name, expiryMs: d.expiry===Infinity?null:d.expiry-now, isLifetime: d.expiry===Infinity, paused: d.paused });
+        }
+        socket.emit("online_update", { online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, slotsUsed: onlineUsers.length, slotsAvailable: Math.max(0,MAX_SLOTS-onlineUsers.length), serverTime: now });
+        return;
+    }
+    socket.on("disconnect", () => console.log(`[SOCKET] DC: ${socket.keyName}`));
+});
 
 function checkKey(key, secret, hwid) {
     if (secret !== SCRIPT_SECRET) return { ok: false, error: "Secret invalido" };
@@ -597,7 +654,7 @@ app.get("/api/admin/users", requireAdminAuth, async (req, res) => {
     res.json(users.map(u => { const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === u.discordId); return { discordId: u.discordId, discordTag: u.discordTag, balance: u.balance, hasKey: !!keyEntry, keyName: keyEntry?.[0] || null, createdAt: u.createdAt }; }));
 });
 
-// ─── BOTS (mesmos do original) ────────────────────────────────────────────────
+// ─── BOTS ────────────────────────────────────────────────────────────────────
 const clientNotifier = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildWebhooks] });
 clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 clientNotifier.on("messageCreate", async (message) => {
@@ -791,7 +848,22 @@ app.get("/logs", requireClientHeader, (req, res) => { const r = checkKey(req.que
 app.get("/api/latest", requireClientHeader, (req, res) => { const r = checkKey(req.query.key, req.query.secret, req.query.hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); if (!brainrots.length) return res.json({ status: "waiting" }); res.json(brainrots[brainrots.length - 1]); });
 app.post("/api/notify", requireClientHeader, (req, res) => { const { secret, name, jobId, value, description } = req.body; if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error" }); const payload = { id: Date.now().toString(), title: name || "Brainrot", description: description || name || "Novo!", brainrot: name || "Brainrot", name: name || "Brainrot", jobId: xorObfuscate(jobId) || null, value: String(value || "0"), players: "N/A" }; pushBrainrot(payload); res.json({ status: "ok", id: payload.id }); });
 app.get("/kicked", requireClientHeader, (req, res) => { if (req.query.secret !== SCRIPT_SECRET) return res.json({ kicked: false }); const keyName = findKey(req.query.key); if (!keyName) return res.json({ kicked: false }); const ts = kicked[keyName.toLowerCase()]; if (ts) { delete kicked[keyName.toLowerCase()]; return res.json({ kicked: true }); } res.json({ kicked: false }); });
-app.post("/presence", requireClientHeader, async (req, res) => { const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query; const r = checkKey(key, secret, hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: (key || "").trim() }; if (jobId && name) userJobIds[name] = jobId; if (discordId && r.keyName) { const d = keys[r.keyName], cleanId = String(discordId).replace(/\D/g, ""); if (cleanId.length >= 17 && !d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); } } res.json({ status: "ok" }); });
+
+app.post("/presence", requireClientHeader, async (req, res) => {
+    const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query;
+    const r = checkKey(key, secret, hwid);
+    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
+    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: (key || "").trim() };
+    if (jobId && name) userJobIds[name] = jobId;
+    if (discordId && r.keyName) {
+        const d = keys[r.keyName], cleanId = String(discordId).replace(/\D/g, "");
+        if (cleanId.length >= 17 && !d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); }
+    }
+    // ← TEMPO REAL: emite para todos os dashboards conectados
+    emitOnlineUpdate();
+    res.json({ status: "ok" });
+});
+
 app.get("/presence", requireClientHeader, (req, res) => { const r = checkKey(req.query.key, req.query.secret, req.query.hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); const now = Date.now(), active = {}; for (const [sid, info] of Object.entries(presence)) { if (now - info.lastSeen < ONLINE_STALE_MS) active[info.name] = true; else delete presence[sid]; } res.json(Object.keys(active).sort()); });
 app.get("/clients", requireClientHeader, (req, res) => { if (req.query.secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error" }); res.send(`Socket.IO: ${io.sockets.sockets.size} | Presença: ${Object.keys(presence).length}`); });
 app.post("/push-brainrot", requireClientHeader, (req, res) => { const { secret, title, description, jobId, value, players } = req.body; if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error" }); const payload = { id: Date.now().toString(), title: title || "Brainrot", description: description || "", brainrot: title || "Brainrot", name: title || "Brainrot", jobId: xorObfuscate(jobId) || null, value: value || "0", players: players || "N/A" }; pushBrainrot(payload); res.json({ status: "ok", id: payload.id }); });
