@@ -64,6 +64,8 @@ const DISCORD_CLIENT_SECRET  = process.env.DISCORD_CLIENT_SECRET   || "";
 const REDIRECT_URI           = `${process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : "http://localhost:3000"}/auth/callback`;
 
 const ADMIN_ROLE_IDS = ["1477885793144930496","1501356382677373101","1477885797553148066"];
+const RECHARGE_CHANNEL = "1511517095412895905";
+const MIN_RECHARGE = 5;
 
 const DEFAULT_PLANS = [
     { label: "1 Hora",   value: "1h",  price: 5,  hours: 1,  emoji: "🕐", active: true },
@@ -140,6 +142,17 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model("Transaction", TransactionSchema);
 
+const RechargeSchema = new mongoose.Schema({
+    discordId:  { type: String, required: true },
+    discordTag: String,
+    amount:     { type: Number, required: true },
+    code:       { type: String, required: true, unique: true },
+    status:     { type: String, default: "pending" }, // pending | confirmed | cancelled
+    confirmedBy: { type: String, default: null },
+    createdAt:  { type: Date, default: Date.now },
+});
+const Recharge = mongoose.model("Recharge", RechargeSchema);
+
 const keys = {}, brainrots = [], presence = {}, kicked = {}, userJobIds = {};
 
 function xorObfuscate(value) {
@@ -189,41 +202,17 @@ function generateBobKey() {
     return r;
 }
 
+function generateRechargeCode() {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let r = "PIX-";
+    for (let i = 0; i < 6; i++) r += chars[Math.floor(Math.random() * chars.length)];
+    return r;
+}
+
 function pushBrainrot(payload) {
     brainrots.push(payload);
     if (brainrots.length > BRAINROT_MAX) brainrots.shift();
     io.emit("brainrot", payload);
-}
-
-// ─── EMIT ONLINE UPDATE (tempo real para o dashboard) ────────────────────────
-function emitOnlineUpdate() {
-    const now = Date.now();
-    const onlineByKey = {};
-    for (const [, info] of Object.entries(presence)) {
-        if (now - info.lastSeen > ONLINE_STALE_MS) continue;
-        const keyName = info.key ? findKey(info.key) : null;
-        if (keyName && !onlineByKey[keyName]) onlineByKey[keyName] = { name: info.name || "Unknown" };
-    }
-    const onlineUsers = [];
-    for (const [keyName, info] of Object.entries(onlineByKey)) {
-        const d = keys[keyName];
-        if (!d) continue;
-        onlineUsers.push({
-            keyPrefix: keyName.substring(0, 7) + "***",
-            robloxName: info.name,
-            expiryMs: d.expiry === Infinity ? null : d.expiry - now,
-            isLifetime: d.expiry === Infinity,
-            paused: d.paused,
-        });
-    }
-    io.emit("online_update", {
-        online: onlineUsers,
-        count: onlineUsers.length,
-        maxSlots: MAX_SLOTS,
-        slotsUsed: onlineUsers.length,
-        slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length),
-        serverTime: now
-    });
 }
 
 async function fetchUserFromAnyClient(userId) {
@@ -339,8 +328,6 @@ setInterval(async () => {
         }
     }
     for (const [sid, info] of Object.entries(presence)) { if (now - info.lastSeen > PRESENCE_TTL) delete presence[sid]; }
-    // Emit após limpeza
-    emitOnlineUpdate();
     const jobKeys = Object.keys(userJobIds);
     if (jobKeys.length > JOBID_MAX) jobKeys.slice(0, jobKeys.length - JOBID_MAX).forEach(k => delete userJobIds[k]);
 }, 60_000);
@@ -439,41 +426,17 @@ function requireAuth(req, res, next) {
 
 function requireAdminAuth(req, res, next) { const pass = req.headers["x-admin-pass"] || req.query.pass; if (!safeCompare(pass, ADMIN_PASS)) return res.status(401).json({ error: "Sem permissão" }); next(); }
 
-// ─── SOCKET.IO MIDDLEWARE (permite viewer do dashboard sem key) ───────────────
 io.use((socket, next) => {
-    const isViewer = socket.handshake.auth?.viewer === "dashboard";
-    if (isViewer) { socket.isViewer = true; return next(); }
-
-    const key    = socket.handshake.auth?.key    || socket.handshake.query?.key;
+    const key = socket.handshake.auth?.key || socket.handshake.query?.key;
     const secret = socket.handshake.auth?.secret || socket.handshake.query?.secret;
-    const hwid   = socket.handshake.auth?.hwid   || socket.handshake.query?.hwid;
+    const hwid = socket.handshake.auth?.hwid || socket.handshake.query?.hwid;
     const header = socket.handshake.headers?.["x-bob-client"];
     if (!header || header !== CLIENT_HEADER) return next(new Error("Acesso negado."));
     const r = checkKey(key, secret, hwid);
     if (!r.ok) return next(new Error(r.error));
     socket.keyName = r.keyName; next();
 });
-
-io.on("connection", (socket) => {
-    if (socket.isViewer) {
-        // Manda o estado atual imediatamente para o dashboard que acabou de conectar
-        const now = Date.now();
-        const onlineByKey = {};
-        for (const [, info] of Object.entries(presence)) {
-            if (now - info.lastSeen > ONLINE_STALE_MS) continue;
-            const keyName = info.key ? findKey(info.key) : null;
-            if (keyName && !onlineByKey[keyName]) onlineByKey[keyName] = { name: info.name || "Unknown" };
-        }
-        const onlineUsers = [];
-        for (const [keyName, info] of Object.entries(onlineByKey)) {
-            const d = keys[keyName]; if (!d) continue;
-            onlineUsers.push({ keyPrefix: keyName.substring(0,7)+"***", robloxName: info.name, expiryMs: d.expiry===Infinity?null:d.expiry-now, isLifetime: d.expiry===Infinity, paused: d.paused });
-        }
-        socket.emit("online_update", { online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, slotsUsed: onlineUsers.length, slotsAvailable: Math.max(0,MAX_SLOTS-onlineUsers.length), serverTime: now });
-        return;
-    }
-    socket.on("disconnect", () => console.log(`[SOCKET] DC: ${socket.keyName}`));
-});
+io.on("connection", (socket) => { socket.on("disconnect", () => console.log(`[SOCKET] DC: ${socket.keyName}`)); });
 
 function checkKey(key, secret, hwid) {
     if (secret !== SCRIPT_SECRET) return { ok: false, error: "Secret invalido" };
@@ -633,6 +596,51 @@ app.get("/api/transactions", requireAuth, async (req, res) => {
     res.json(transactions);
 });
 
+// ─── RECARGA PIX MANUAL ───────────────────────────────────────────────────────
+app.post("/api/recharge/create", requireAuth, async (req, res) => {
+    const { amount } = req.body;
+    if (!amount || isNaN(amount) || amount < MIN_RECHARGE) {
+        return res.status(400).json({ error: `Valor mínimo é R$${MIN_RECHARGE}` });
+    }
+    const user = await User.findOne({ discordId: req.user.discordId });
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+
+    // Cancela recargas pendentes antigas do mesmo usuário
+    await Recharge.updateMany({ discordId: req.user.discordId, status: "pending" }, { status: "cancelled" });
+
+    const code = generateRechargeCode();
+    await Recharge.create({ discordId: req.user.discordId, discordTag: user.discordTag, amount: Number(amount), code });
+
+    // Notifica no Discord
+    try {
+        const ch = await clientPayment.channels.fetch(RECHARGE_CHANNEL);
+        if (ch) {
+            const embed = new EmbedBuilder()
+                .setColor(COLORS.info)
+                .setTitle("💸 Nova Solicitação de Recarga")
+                .addFields(
+                    { name: "👤 Usuário", value: `${user.discordTag} (<@${user.discordId}>)`, inline: true },
+                    { name: "💰 Valor", value: `**R$${Number(amount).toFixed(2)}**`, inline: true },
+                    { name: "🔑 Código", value: `\`${code}\``, inline: true },
+                    { name: "📋 Instrução", value: `Verifique o Pix recebido com o código **${code}** na descrição e confirme abaixo.`, inline: false }
+                )
+                .setTimestamp();
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`recharge_confirm_${code}`).setLabel("✅ Confirmar Pagamento").setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`recharge_cancel_${code}`).setLabel("❌ Cancelar").setStyle(ButtonStyle.Danger),
+            );
+            await ch.send({ embeds: [embed], components: [row] });
+        }
+    } catch(e) { console.error("[RECHARGE] Erro ao notificar Discord:", e.message); }
+
+    res.json({ ok: true, code, amount: Number(amount), pixKey: PIX_KEY, pixName: PIX_NAME });
+});
+
+app.get("/api/recharge/status", requireAuth, async (req, res) => {
+    const recharge = await Recharge.findOne({ discordId: req.user.discordId, status: "pending" }).sort({ createdAt: -1 });
+    res.json(recharge ? { pending: true, code: recharge.code, amount: recharge.amount, createdAt: recharge.createdAt } : { pending: false });
+});
+
 app.post("/api/admin/balance", requireAdminAuth, async (req, res) => {
     const { discordId, amount, description } = req.body;
     if (!discordId || !amount) return res.status(400).json({ error: "Dados inválidos" });
@@ -654,7 +662,7 @@ app.get("/api/admin/users", requireAdminAuth, async (req, res) => {
     res.json(users.map(u => { const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === u.discordId); return { discordId: u.discordId, discordTag: u.discordTag, balance: u.balance, hasKey: !!keyEntry, keyName: keyEntry?.[0] || null, createdAt: u.createdAt }; }));
 });
 
-// ─── BOTS ────────────────────────────────────────────────────────────────────
+// ─── BOTS (mesmos do original) ────────────────────────────────────────────────
 const clientNotifier = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildWebhooks] });
 clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 clientNotifier.on("messageCreate", async (message) => {
@@ -828,6 +836,87 @@ clientPayment.on(Events.InteractionCreate, async (interaction) => {
     if (id === "buy_cupom") { await interaction.deleteReply().catch(() => {}); await interaction.showModal(new ModalBuilder().setCustomId("modal_cupom").setTitle("🎟️ Cupom").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("coupon_code").setLabel("Código:").setStyle(TextInputStyle.Short).setRequired(true)))); return; }
     if (id.startsWith("buy_") && id !== "buy_minhakey") { const planValue = id.replace("buy_", ""), plan = getActivePlans().find(p => p.value === planValue); if (!plan) { await interaction.editReply({ content: "❌ Plano inválido!" }); return; } const existing = await PendingPayment.findOne({ discordId: user.id }); const now = Date.now(); if (existing) { const rem = PENDING_EXPIRY_MS - (now - new Date(existing.createdAt).getTime()); if (rem > 0) { await interaction.editReply({ content: `⚠️ Pedido ativo! Expira em **${formatTimeShort(rem)}**.` }); return; } } const couponData = pendingCoupon[user.id]?.plan === planValue ? pendingCoupon[user.id] : null; let finalPrice = plan.price, couponUsed = null; if (couponData) { finalPrice = couponData.finalPrice; couponUsed = couponData.coupon; delete pendingCoupon[user.id]; } await PendingPayment.findOneAndUpdate({ discordId: user.id }, { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, finalPrice, label: plan.label, couponUsed, warningSent: false, createdAt: new Date() }, { upsert: true, new: true }); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle("💳 Pix").setDescription(`**${plan.emoji} ${plan.label}** — R$${finalPrice},00\n\n**Chave Pix:**\n\`\`\`${PIX_KEY}\`\`\`**Nome:** ${PIX_NAME}\n\n> Envie o comprovante aqui!\n> ⏳ **15 minutos** para pagar.`).setTimestamp()] }); return; }
     if (id === "buy_minhakey") { const userKeys = Object.entries(keys).filter(([, d]) => d.discordId === user.id); if (!userKeys.length) { await interaction.editReply({ content: "❌ Nenhuma key!" }); return; } const now = Date.now(); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔑 Suas Keys").setDescription(userKeys.map(([k, d]) => `\`${k}\` — ${d.expiry === Infinity ? "Lifetime ♾️" : (d.expiry - now > 0 ? formatTime(d.expiry - now) : "❌")} ${d.paused ? "⏸️" : "✅"}`).join("\n")).setTimestamp()] }); return; }
+
+    // ── RECARGA PIX MANUAL ──
+    if (id.startsWith("recharge_confirm_")) {
+        const code = id.replace("recharge_confirm_", "");
+        const recharge = await Recharge.findOne({ code, status: "pending" });
+        if (!recharge) { await interaction.editReply({ content: "❌ Recarga não encontrada ou já processada." }); return; }
+
+        // Adiciona saldo
+        const updatedUser = await User.findOneAndUpdate(
+            { discordId: recharge.discordId },
+            { $inc: { balance: recharge.amount } },
+            { new: true }
+        );
+        if (!updatedUser) { await interaction.editReply({ content: "❌ Usuário não encontrado no banco." }); return; }
+
+        await Transaction.create({
+            discordId: recharge.discordId,
+            type: "deposit",
+            amount: recharge.amount,
+            description: `Recarga Pix — ${code}`
+        });
+
+        await Recharge.updateOne({ code }, { status: "confirmed", confirmedBy: interaction.user.id });
+
+        // DM pro usuário
+        fetchUserFromAnyClient(recharge.discordId).then(u => {
+            if (u) u.send({ embeds: [new EmbedBuilder()
+                .setColor(COLORS.success)
+                .setTitle("💰 Recarga Confirmada!")
+                .setDescription(`**R$${recharge.amount.toFixed(2)}** foram adicionados ao seu saldo!\n**Novo saldo:** R$${updatedUser.balance.toFixed(2)}\n**Código:** \`${code}\``)
+                .setTimestamp()] }).catch(() => {});
+        });
+
+        // Edita a mensagem do Discord desabilitando os botões
+        await interaction.message.edit({
+            embeds: [new EmbedBuilder()
+                .setColor(COLORS.success)
+                .setTitle("✅ Recarga Confirmada")
+                .addFields(
+                    { name: "👤 Usuário", value: `${recharge.discordTag} (<@${recharge.discordId}>)`, inline: true },
+                    { name: "💰 Valor", value: `R$${recharge.amount.toFixed(2)}`, inline: true },
+                    { name: "🔑 Código", value: `\`${code}\``, inline: true },
+                    { name: "✅ Confirmado por", value: `<@${interaction.user.id}>`, inline: false }
+                ).setTimestamp()],
+            components: []
+        }).catch(() => {});
+
+        await interaction.editReply({ content: `✅ Recarga de R$${recharge.amount.toFixed(2)} confirmada para ${recharge.discordTag}!` });
+        return;
+    }
+
+    if (id.startsWith("recharge_cancel_")) {
+        const code = id.replace("recharge_cancel_", "");
+        const recharge = await Recharge.findOne({ code, status: "pending" });
+        if (!recharge) { await interaction.editReply({ content: "❌ Recarga não encontrada ou já processada." }); return; }
+
+        await Recharge.updateOne({ code }, { status: "cancelled" });
+
+        fetchUserFromAnyClient(recharge.discordId).then(u => {
+            if (u) u.send({ embeds: [new EmbedBuilder()
+                .setColor(COLORS.danger)
+                .setTitle("❌ Recarga Cancelada")
+                .setDescription(`Sua recarga de **R$${recharge.amount.toFixed(2)}** foi cancelada.\nCódigo: \`${code}\``)
+                .setTimestamp()] }).catch(() => {});
+        });
+
+        await interaction.message.edit({
+            embeds: [new EmbedBuilder()
+                .setColor(COLORS.danger)
+                .setTitle("❌ Recarga Cancelada")
+                .addFields(
+                    { name: "👤 Usuário", value: `${recharge.discordTag}`, inline: true },
+                    { name: "💰 Valor", value: `R$${recharge.amount.toFixed(2)}`, inline: true },
+                    { name: "🔑 Código", value: `\`${code}\``, inline: true }
+                ).setTimestamp()],
+            components: []
+        }).catch(() => {});
+
+        await interaction.editReply({ content: `🗑️ Recarga cancelada.` });
+        return;
+    }
 });
 
 function requireDashAuth(req, res, next) { const pass = req.query.pass || req.headers["x-admin-pass"]; if (!safeCompare(pass, ADMIN_PASS)) return res.status(401).json({ error: "Unauthorized" }); next(); }
@@ -848,22 +937,7 @@ app.get("/logs", requireClientHeader, (req, res) => { const r = checkKey(req.que
 app.get("/api/latest", requireClientHeader, (req, res) => { const r = checkKey(req.query.key, req.query.secret, req.query.hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); if (!brainrots.length) return res.json({ status: "waiting" }); res.json(brainrots[brainrots.length - 1]); });
 app.post("/api/notify", requireClientHeader, (req, res) => { const { secret, name, jobId, value, description } = req.body; if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error" }); const payload = { id: Date.now().toString(), title: name || "Brainrot", description: description || name || "Novo!", brainrot: name || "Brainrot", name: name || "Brainrot", jobId: xorObfuscate(jobId) || null, value: String(value || "0"), players: "N/A" }; pushBrainrot(payload); res.json({ status: "ok", id: payload.id }); });
 app.get("/kicked", requireClientHeader, (req, res) => { if (req.query.secret !== SCRIPT_SECRET) return res.json({ kicked: false }); const keyName = findKey(req.query.key); if (!keyName) return res.json({ kicked: false }); const ts = kicked[keyName.toLowerCase()]; if (ts) { delete kicked[keyName.toLowerCase()]; return res.json({ kicked: true }); } res.json({ kicked: false }); });
-
-app.post("/presence", requireClientHeader, async (req, res) => {
-    const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query;
-    const r = checkKey(key, secret, hwid);
-    if (!r.ok) return res.status(403).json({ status: "error", message: r.error });
-    presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: (key || "").trim() };
-    if (jobId && name) userJobIds[name] = jobId;
-    if (discordId && r.keyName) {
-        const d = keys[r.keyName], cleanId = String(discordId).replace(/\D/g, "");
-        if (cleanId.length >= 17 && !d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); }
-    }
-    // ← TEMPO REAL: emite para todos os dashboards conectados
-    emitOnlineUpdate();
-    res.json({ status: "ok" });
-});
-
+app.post("/presence", requireClientHeader, async (req, res) => { const { key, secret, hwid, sessionId, name, jobId, discordId } = req.query; const r = checkKey(key, secret, hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); presence[sessionId] = { name: name || "Unknown", lastSeen: Date.now(), key: (key || "").trim() }; if (jobId && name) userJobIds[name] = jobId; if (discordId && r.keyName) { const d = keys[r.keyName], cleanId = String(discordId).replace(/\D/g, ""); if (cleanId.length >= 17 && !d.discordId) { d.discordId = cleanId; await saveKey(r.keyName); } } res.json({ status: "ok" }); });
 app.get("/presence", requireClientHeader, (req, res) => { const r = checkKey(req.query.key, req.query.secret, req.query.hwid); if (!r.ok) return res.status(403).json({ status: "error", message: r.error }); const now = Date.now(), active = {}; for (const [sid, info] of Object.entries(presence)) { if (now - info.lastSeen < ONLINE_STALE_MS) active[info.name] = true; else delete presence[sid]; } res.json(Object.keys(active).sort()); });
 app.get("/clients", requireClientHeader, (req, res) => { if (req.query.secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error" }); res.send(`Socket.IO: ${io.sockets.sockets.size} | Presença: ${Object.keys(presence).length}`); });
 app.post("/push-brainrot", requireClientHeader, (req, res) => { const { secret, title, description, jobId, value, players } = req.body; if (secret !== SCRIPT_SECRET) return res.status(403).json({ status: "error" }); const payload = { id: Date.now().toString(), title: title || "Brainrot", description: description || "", brainrot: title || "Brainrot", name: title || "Brainrot", jobId: xorObfuscate(jobId) || null, value: value || "0", players: players || "N/A" }; pushBrainrot(payload); res.json({ status: "ok", id: payload.id }); });
