@@ -3,7 +3,7 @@ const express  = require("express");
 const http     = require("http");
 const crypto   = require("crypto");
 const path     = require("path");
-const jwt = require("jsonwebtoken");
+const jwt      = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const {
     Client, GatewayIntentBits,
@@ -23,6 +23,7 @@ const RATE_LIMIT_WINDOW  = 60_000;
 const BLOCK_DURATION     = 5  * 60 * 1_000;
 const PENDING_EXPIRY_MS  = 15 * 60 * 1_000;
 const KEY_WARN_BEFORE_MS = 30 * 60 * 1_000;
+const MAX_SLOTS          = parseInt(process.env.MAX_SLOTS || "3");
 
 const COLORS = {
     primary:  0x5865F2, success:  0x00E676, danger:   0xFF3C3C,
@@ -42,6 +43,7 @@ const ADMIN_PASS    = requireEnv("ADMIN_PASS");
 const SCRIPT_SECRET = requireEnv("SCRIPT_SECRET");
 const XOR_KEY       = requireEnv("XOR_KEY");
 const MONGODB_URI   = requireEnv("MONGODB_URI");
+const JWT_SECRET    = process.env.JWT_SECRET || "bobjoiner_jwt_secret_2026";
 
 const CLIENT_HEADER          = process.env.CLIENT_HEADER           || "BobJoiner-v2";
 const PIX_KEY                = process.env.PIX_KEY                 || "";
@@ -59,7 +61,6 @@ const SCRIPT_URL             = process.env.SCRIPT_URL              || "";
 const FRONTEND_URL           = process.env.FRONTEND_URL            || "http://localhost:3001";
 const DISCORD_CLIENT_ID      = process.env.DISCORD_CLIENT_ID       || "";
 const DISCORD_CLIENT_SECRET  = process.env.DISCORD_CLIENT_SECRET   || "";
-const JWT_SECRET             = process.env.JWT_SECRET              || "bobsecret_jwt";
 const REDIRECT_URI           = `${process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : "http://localhost:3000"}/auth/callback`;
 
 const ADMIN_ROLE_IDS = ["1477885793144930496","1501356382677373101","1477885797553148066"];
@@ -85,6 +86,7 @@ const KeySchema = new mongoose.Schema({
     hwid:      { type: String, default: null },
     discordId: { type: String, default: null },
     warnSent:  { type: Boolean, default: false },
+    isAutoKey: { type: Boolean, default: false },
 });
 const KeyModel = mongoose.model("Key", KeySchema);
 
@@ -179,7 +181,6 @@ const formatTimeShort = (ms) => {
 
 const findKey    = (name) => Object.keys(keys).find(k => k.toLowerCase() === (name || "").trim().toLowerCase());
 const tsRelative = (date) => `<t:${Math.floor(new Date(date).getTime() / 1000)}:R>`;
-const tsAbsolute = (date) => `<t:${Math.floor(new Date(date).getTime() / 1000)}:f>`;
 
 function generateBobKey() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -237,8 +238,18 @@ async function loadKeys() {
         for (const d of docs) {
             const expiry = d.expiry >= LIFETIME_VALUE ? Infinity : d.expiry;
             const remaining = d.remaining >= LIFETIME_VALUE ? Infinity : d.remaining;
-            if (expiry !== Infinity && expiry - Date.now() <= 0) { await KeyModel.deleteOne({ name: d.name }); expired++; continue; }
-            keys[d.name] = { expiry, paused: d.paused, remaining, hwid: d.hwid || null, discordId: d.discordId || null, warnSent: d.warnSent || false };
+            if (d.isAutoKey && d.expiry === 0 && d.paused) {
+                keys[d.name] = { expiry: 0, paused: true, remaining: 0, hwid: d.hwid || null, discordId: d.discordId || null, warnSent: false, isAutoKey: true };
+                continue;
+            }
+            if (expiry !== Infinity && !d.paused && expiry - Date.now() <= 0) {
+                await KeyModel.deleteOne({ name: d.name }); expired++; continue;
+            }
+            keys[d.name] = {
+                expiry, paused: d.paused, remaining, hwid: d.hwid || null,
+                discordId: d.discordId || null, warnSent: d.warnSent || false,
+                isAutoKey: d.isAutoKey || false,
+            };
         }
         console.log(`[DB] ${Object.keys(keys).length} keys carregadas. ${expired} expiradas removidas.`);
     } catch (e) { console.error("[DB] Erro ao carregar keys:", e.message); }
@@ -257,9 +268,38 @@ async function deleteKey(name) {
     try { await KeyModel.deleteOne({ name }); } catch (e) { console.error("[DB] Erro ao deletar key:", e.message); }
 }
 
+async function createAutoKeyForUser(discordId, discordTag) {
+    const discordIdStr = String(discordId);
+    const existing = Object.entries(keys).find(([, d]) => d.discordId === discordIdStr);
+    if (existing) {
+        console.log(`[AUTH] Usuário ${discordTag} já tem key em memória: ${existing[0]}`);
+        return existing[0];
+    }
+    const existingInDB = await KeyModel.findOne({ discordId: discordIdStr });
+    if (existingInDB) {
+        console.log(`[AUTH] Usuário ${discordTag} já tem key no banco: ${existingInDB.name}`);
+        if (!keys[existingInDB.name]) {
+            const expiry = existingInDB.expiry >= LIFETIME_VALUE ? Infinity : existingInDB.expiry;
+            const remaining = existingInDB.remaining >= LIFETIME_VALUE ? Infinity : existingInDB.remaining;
+            keys[existingInDB.name] = {
+                expiry, paused: existingInDB.paused, remaining,
+                hwid: existingInDB.hwid || null, discordId: discordIdStr,
+                warnSent: existingInDB.warnSent || false, isAutoKey: existingInDB.isAutoKey || false,
+            };
+        }
+        return existingInDB.name;
+    }
+    const keyName = generateBobKey();
+    keys[keyName] = { expiry: 0, paused: true, remaining: 0, hwid: null, discordId: discordIdStr, warnSent: false, isAutoKey: true };
+    await saveKey(keyName);
+    console.log(`[AUTH] ✅ Key auto-gerada no login: ${keyName} → ${discordTag}`);
+    return keyName;
+}
+
 setInterval(async () => {
     const now = Date.now();
     for (const [name, data] of Object.entries(keys)) {
+        if (data.isAutoKey && data.expiry === 0 && data.paused) continue;
         if (data.expiry !== Infinity && !data.paused && data.expiry - now <= 0) {
             if (data.discordId) fetchUserFromAnyClient(data.discordId).then(user => {
                 if (user) user.send({ embeds: [new EmbedBuilder().setColor(COLORS.danger).setTitle("⌛ Sua key expirou!").setDescription(`Sua key \`${name}\` expirou. Acesse a loja para renovar!`).setTimestamp()] }).catch(() => {});
@@ -313,16 +353,6 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, allowEIO3: true, transports: ["polling", "websocket"] });
 const port = process.env.PORT || 3000;
 
-// ─── JWT AUTH ─────────────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-    const token = req.headers["x-auth-token"];
-    if (token) {
-        try { req.jwtUser = jwt.verify(token, JWT_SECRET); } catch { req.jwtUser = null; }
-    } else { req.jwtUser = null; }
-    req.session = { user: req.jwtUser };
-    next();
-});
-
 app.use((req, res, next) => {
     const allowed = [FRONTEND_URL, "http://localhost:3001", "http://localhost:3000"];
     const origin = req.headers.origin;
@@ -330,7 +360,7 @@ app.use((req, res, next) => {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Access-Control-Allow-Credentials", "true");
         res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass,x-auth-token,Authorization");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-admin-pass,Authorization");
     }
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
@@ -347,7 +377,7 @@ async function logSecurityAlert(message) {
 }
 
 function rateLimitMiddleware(req, res, next) {
-    const openRoutes = ["/health", "/", "/dashboard", "/api/dashboard", "/auth/", "/api/admin/", "/api/buy", "/api/transactions", "/auth/me"];
+    const openRoutes = ["/health", "/", "/dashboard", "/api/dashboard", "/auth/", "/api/admin/", "/api/buy", "/api/transactions", "/auth/me", "/api/online"];
     if (openRoutes.some(r => req.path.startsWith(r))) return next();
     const ip = getRealIP(req), now = Date.now();
     if (blockedIPs[ip]) { if (now < blockedIPs[ip]) return res.status(429).json({ status: "error", message: "IP bloqueado." }); delete blockedIPs[ip]; }
@@ -366,7 +396,14 @@ function requireClientHeader(req, res, next) {
 
 app.use(rateLimitMiddleware);
 
-function requireAuth(req, res, next) { if (!req.session?.user) return res.status(401).json({ error: "Não autenticado" }); next(); }
+function requireAuth(req, res, next) {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "Não autenticado" });
+    try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+    catch (e) { return res.status(401).json({ error: "Token inválido ou expirado" }); }
+}
+
 function requireAdminAuth(req, res, next) { const pass = req.headers["x-admin-pass"] || req.query.pass; if (!safeCompare(pass, ADMIN_PASS)) return res.status(401).json({ error: "Sem permissão" }); next(); }
 
 io.use((socket, next) => {
@@ -394,33 +431,54 @@ function checkKey(key, secret, hwid) {
 
 async function confirmarPagamento(user, hours, channel, confirmedBy = "admin", price = null, label = null, couponUsed = null) {
     const expiresAt = Date.now() + hours * 3_600_000;
+    const addMs = hours * 3_600_000;
     const existingKeyEntry = Object.entries(keys).find(([, d]) => d.discordId === String(user.id));
+
     if (existingKeyEntry) {
         const [existingName, existingData] = existingKeyEntry;
-        const addMs = hours * 3_600_000;
-        if (existingData.paused) existingData.remaining += addMs;
-        else if (existingData.expiry !== Infinity) existingData.expiry += addMs;
-        existingData.warnSent = false; await saveKey(existingName);
+        if (existingData.paused) {
+            if (existingData.isAutoKey && existingData.remaining === 0) {
+                existingData.remaining = addMs;
+                existingData.expiry = Date.now() + addMs;
+                existingData.paused = false;
+                existingData.isAutoKey = false;
+            } else {
+                existingData.remaining += addMs;
+            }
+        } else if (existingData.expiry !== Infinity) {
+            existingData.expiry += addMs;
+        }
+        existingData.warnSent = false;
+        await saveKey(existingName);
         const plan = PLANS.find(p => p.hours === hours);
-        price = price || plan?.price || hours * 5; label = label || plan?.label || `${hours}h`;
+        price = price || plan?.price || hours * 5;
+        label = label || plan?.label || `${hours}h`;
         await SaleHistory.create({ discordId: String(user.id), discordTag: user.tag, hours, price, label, keyName: existingName, couponUsed, confirmedBy: String(confirmedBy) }).catch(() => {});
-        fetchUserFromAnyClient(user.id).then(u => { if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Key Renovada!").setDescription(`Sua key \`${existingName}\` foi renovada!\n**+Tempo:** ${label}\n**Expira:** ${tsRelative(existingData.expiry)}`).setTimestamp()] }).catch(() => {}); }).catch(() => {});
-        if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Renovação").setDescription(`<@${user.id}> — \`${existingName}\` +${label}`).setTimestamp()] }).catch(() => {});
+        fetchUserFromAnyClient(user.id).then(u => {
+            if (!u) return;
+            const timeLeft = existingData.expiry === Infinity ? "Lifetime ♾️" : tsRelative(existingData.expiry);
+            u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Key Atualizada!").setDescription(`Sua key \`${existingName}\` foi atualizada!\n**+Tempo:** ${label}\n**Expira:** ${timeLeft}`).setTimestamp()] }).catch(() => {});
+        }).catch(() => {});
+        if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔄 Renovação/Ativação").setDescription(`<@${user.id}> — \`${existingName}\` +${label}`).setTimestamp()] }).catch(() => {});
         return;
     }
+
     const keyName = generateBobKey();
     const plan = PLANS.find(p => p.hours === hours);
-    price = price || plan?.price || hours * 5; label = label || plan?.label || `${hours}h`;
-    keys[keyName] = { expiry: expiresAt, paused: false, remaining: hours * 3_600_000, hwid: null, discordId: String(user.id), warnSent: false };
+    price = price || plan?.price || hours * 5;
+    label = label || plan?.label || `${hours}h`;
+    keys[keyName] = { expiry: expiresAt, paused: false, remaining: addMs, hwid: null, discordId: String(user.id), warnSent: false, isAutoKey: false };
     await saveKey(keyName);
     await SaleHistory.create({ discordId: String(user.id), discordTag: user.tag, hours, price, label, keyName, couponUsed, confirmedBy: String(confirmedBy) }).catch(() => {});
-    fetchUserFromAnyClient(user.id).then(u => { if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎉 Pagamento Confirmado!").setDescription(`**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${label}\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] }).catch(() => {}); }).catch(() => {});
+    fetchUserFromAnyClient(user.id).then(u => {
+        if (u) u.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎉 Pagamento Confirmado!").setDescription(`**🔑 Sua Key:**\n\`\`\`${keyName}\`\`\`\n**Plano:** ${label}\n**Expira:** ${tsRelative(expiresAt)}`).setTimestamp()] }).catch(() => {});
+    });
     if (channel) channel.send({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("✅ Key Gerada").setDescription(`<@${user.id}> — \`${keyName}\` — ${label}`).setTimestamp()] }).catch(() => {});
     console.log(`[PAYMENT] ✅ Key gerada: ${keyName} (${hours}h)`);
 }
 
-async function opCreateKey(name, durationMs) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" }; keys[name] = { expiry: Date.now() + durationMs, paused: false, remaining: durationMs, hwid: null, discordId: null, warnSent: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` criada! **${formatTime(durationMs)}**` }; }
-async function opCreateLifetime(name) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null, warnSent: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` Lifetime ♾️` }; }
+async function opCreateKey(name, durationMs) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; if (durationMs <= 0) return { ok: false, msg: "❌ Duração inválida!" }; keys[name] = { expiry: Date.now() + durationMs, paused: false, remaining: durationMs, hwid: null, discordId: null, warnSent: false, isAutoKey: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` criada! **${formatTime(durationMs)}**` }; }
+async function opCreateLifetime(name) { if (findKey(name)) return { ok: false, msg: `❌ \`${name}\` já existe!` }; keys[name] = { expiry: Infinity, paused: false, remaining: Infinity, hwid: null, discordId: null, warnSent: false, isAutoKey: false }; await saveKey(name); return { ok: true, msg: `✅ \`${name}\` Lifetime ♾️` }; }
 async function opRevokeKey(name) { if (name.toLowerCase() === "all") { const count = Object.keys(keys).length; for (const k of Object.keys(keys)) { delete keys[k]; await deleteKey(k); } return { ok: true, msg: `🗑️ **${count}** removidas.` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; delete keys[t]; await deleteKey(t); return { ok: true, msg: `🗑️ \`${t}\` removida.` }; }
 async function opTogglePause(name) { if (name.toLowerCase() === "all") { let p = 0, r = 0; for (const k of Object.keys(keys)) { const d = keys[k]; if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; r++; } else { d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; p++; } await saveKey(k); } return { ok: true, msg: `⏸️ ${p} pausadas, ${r} retomadas.` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; const d = keys[t]; if (d.paused) { d.expiry = Date.now() + d.remaining; d.paused = false; await saveKey(t); return { ok: true, msg: `▶️ \`${t}\` retomada!` }; } d.remaining = d.expiry === Infinity ? Infinity : d.expiry - Date.now(); d.paused = true; await saveKey(t); return { ok: true, msg: `⏸️ \`${t}\` pausada!` }; }
 async function opResetHwid(name) { if (name.toLowerCase() === "all") { let count = 0; for (const k of Object.keys(keys)) { keys[k].hwid = null; kicked[k.toLowerCase()] = Date.now(); await saveKey(k); count++; } return { ok: true, msg: `✅ HWID de **${count}** resetado!` }; } const t = findKey(name); if (!t) return { ok: false, msg: "❌ Não encontrada." }; keys[t].hwid = null; kicked[t.toLowerCase()] = Date.now(); await saveKey(t); return { ok: true, msg: `✅ HWID de \`${t}\` resetado!` }; }
@@ -446,6 +504,8 @@ app.get("/auth/callback", async (req, res) => {
         const userRes = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: `Bearer ${tokenData.access_token}` } });
         const discordUser = await userRes.json();
         await User.findOneAndUpdate({ discordId: discordUser.id }, { discordTag: discordUser.username, avatar: discordUser.avatar }, { upsert: true, new: true });
+        const autoKeyName = await createAutoKeyForUser(discordUser.id, discordUser.username);
+        console.log(`[AUTH] Key do usuário ${discordUser.username}: ${autoKeyName}`);
         const token = jwt.sign({ discordId: discordUser.id, discordTag: discordUser.username, avatar: discordUser.avatar }, JWT_SECRET, { expiresIn: "7d" });
         res.redirect(`${FRONTEND_URL}/?token=${token}`);
     } catch (e) { console.error("[AUTH]", e.message); res.redirect(`${FRONTEND_URL}?error=auth_failed`); }
@@ -454,18 +514,55 @@ app.get("/auth/callback", async (req, res) => {
 app.get("/auth/logout", (req, res) => { res.json({ ok: true }); });
 
 app.get("/auth/me", requireAuth, async (req, res) => {
-    const user = await User.findOne({ discordId: req.session.user.discordId });
+    const user = await User.findOne({ discordId: req.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
     const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === user.discordId);
-    const keyData = keyEntry ? { name: keyEntry[0], expiry: keyEntry[1].expiry === Infinity ? null : keyEntry[1].expiry, paused: keyEntry[1].paused, timeLeft: keyEntry[1].expiry === Infinity ? "Lifetime" : formatTime(keyEntry[1].expiry - Date.now()) } : null;
+    let keyData = null;
+    if (keyEntry) {
+        const [keyName, kd] = keyEntry;
+        const now = Date.now();
+        const hasTime = kd.expiry === Infinity || (!kd.paused && kd.expiry - now > 0) || (kd.paused && kd.remaining > 0);
+        keyData = {
+            name: keyName,
+            expiry: kd.expiry === Infinity ? null : kd.expiry,
+            expiryMs: kd.expiry === Infinity ? null : kd.expiry - now,
+            paused: kd.paused,
+            isAutoKey: kd.isAutoKey || false,
+            hasTime,
+            timeLeft: kd.expiry === Infinity ? "Lifetime" : kd.paused ? formatTime(kd.remaining) : formatTime(kd.expiry - now),
+        };
+    }
     res.json({ discordId: user.discordId, discordTag: user.discordTag, avatar: user.avatar, balance: user.balance, key: keyData, plans: PLANS.filter(p => p.active) });
+});
+
+app.get("/api/online", (req, res) => {
+    const now = Date.now();
+    const onlineByKey = {};
+    for (const [, info] of Object.entries(presence)) {
+        if (now - info.lastSeen > ONLINE_STALE_MS) continue;
+        const keyName = info.key ? findKey(info.key) : null;
+        if (keyName && !onlineByKey[keyName]) onlineByKey[keyName] = { name: info.name || "Unknown" };
+    }
+    const onlineUsers = [];
+    for (const [keyName, info] of Object.entries(onlineByKey)) {
+        const d = keys[keyName];
+        if (!d) continue;
+        onlineUsers.push({
+            keyPrefix: keyName.substring(0, 7) + "***",
+            robloxName: info.name,
+            expiryMs: d.expiry === Infinity ? null : d.expiry - now,
+            isLifetime: d.expiry === Infinity,
+            paused: d.paused,
+        });
+    }
+    res.json({ online: onlineUsers, count: onlineUsers.length, maxSlots: MAX_SLOTS, slotsUsed: onlineUsers.length, slotsAvailable: Math.max(0, MAX_SLOTS - onlineUsers.length), serverTime: now });
 });
 
 app.post("/api/buy", requireAuth, async (req, res) => {
     const { planValue } = req.body;
     const plan = PLANS.find(p => p.value === planValue && p.active);
     if (!plan) return res.status(400).json({ error: "Plano inválido" });
-    const user = await User.findOne({ discordId: req.session.user.discordId });
+    const user = await User.findOne({ discordId: req.user.discordId });
     if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
     if (user.balance < plan.price) return res.status(400).json({ error: "Saldo insuficiente" });
     user.balance -= plan.price; await user.save();
@@ -474,21 +571,8 @@ app.post("/api/buy", requireAuth, async (req, res) => {
     res.json({ ok: true, newBalance: user.balance, plan: plan.label });
 });
 
-app.post("/api/buy-midlights", requireAuth, async (req, res) => {
-    const { hours } = req.body;
-    if (!hours || hours < 1) return res.status(400).json({ error: "Horas inválidas" });
-    const price = hours * 5;
-    const user = await User.findOne({ discordId: req.session.user.discordId });
-    if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
-    if (user.balance < price) return res.status(400).json({ error: "Saldo insuficiente" });
-    user.balance -= price; await user.save();
-    await confirmarPagamento({ id: user.discordId, tag: user.discordTag }, hours, null, "auto", price, `Midlights ${hours}h`, null);
-    await Transaction.create({ discordId: user.discordId, type: "purchase", amount: -price, description: `Midlights: ${hours}h` });
-    res.json({ ok: true, newBalance: user.balance });
-});
-
 app.get("/api/transactions", requireAuth, async (req, res) => {
-    const transactions = await Transaction.find({ discordId: req.session.user.discordId }).sort({ createdAt: -1 }).limit(20);
+    const transactions = await Transaction.find({ discordId: req.user.discordId }).sort({ createdAt: -1 }).limit(20);
     res.json(transactions);
 });
 
@@ -501,12 +585,19 @@ app.post("/api/admin/balance", requireAdminAuth, async (req, res) => {
     res.json({ ok: true, newBalance: user.balance, discordTag: user.discordTag });
 });
 
+app.post("/api/admin/slots", requireAdminAuth, async (req, res) => {
+    const { maxSlots } = req.body;
+    if (!maxSlots || isNaN(maxSlots) || maxSlots < 1) return res.status(400).json({ error: "Valor inválido" });
+    process.env.MAX_SLOTS = String(maxSlots);
+    res.json({ ok: true, maxSlots: parseInt(maxSlots) });
+});
+
 app.get("/api/admin/users", requireAdminAuth, async (req, res) => {
     const users = await User.find().sort({ createdAt: -1 });
     res.json(users.map(u => { const keyEntry = Object.entries(keys).find(([, d]) => d.discordId === u.discordId); return { discordId: u.discordId, discordTag: u.discordTag, balance: u.balance, hasKey: !!keyEntry, keyName: keyEntry?.[0] || null, createdAt: u.createdAt }; }));
 });
 
-// ─── BOTS ─────────────────────────────────────────────────────────────────────
+// ─── BOTS (mesmos do original) ────────────────────────────────────────────────
 const clientNotifier = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildWebhooks] });
 clientNotifier.on("ready", () => console.log(`[NOTIFIER] Online: ${clientNotifier.user.tag}`));
 clientNotifier.on("messageCreate", async (message) => {
@@ -540,7 +631,7 @@ async function sendLogsPanel() {
 function buildOnlineEmbed() {
     const now = Date.now(), robloxByKey = {};
     for (const [, info] of Object.entries(presence)) { const keyName = info.key ? findKey(info.key) : null; if (keyName && !robloxByKey[keyName] && now - info.lastSeen < PRESENCE_TTL) robloxByKey[keyName] = info.name || null; }
-    const activeKeys = Object.entries(keys).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
+    const activeKeys = Object.entries(keys).filter(([, d]) => !d.isAutoKey || d.remaining > 0).filter(([, d]) => d.paused || d.expiry === Infinity || d.expiry - now > 0);
     const onlineCount = Object.values(robloxByKey).length;
     const embed = new EmbedBuilder().setTitle(`📋 Keys — ${activeKeys.length} | 🟢 ${onlineCount} online`).setColor(onlineCount > 0 ? COLORS.success : COLORS.primary).setTimestamp();
     if (!activeKeys.length) { embed.setDescription("Nenhuma key ativa."); return embed; }
@@ -561,20 +652,11 @@ clientLogs.on(Events.InteractionCreate, async (interaction) => {
     const id = interaction.customId;
     if (id === "logs_online") { await interaction.deferReply({ ephemeral: false }); const sentMsg = await interaction.editReply({ embeds: [buildOnlineEmbed()] }); startOnlineInterval(interaction.channelId, sentMsg); return; }
     if (id === "logs_stoponline") { await interaction.deferReply({ flags: 64 }); stopOnlineInterval(interaction.channelId); await interaction.editReply({ content: "⏹️ Parado." }); return; }
-    if (id === "logs_stats") {
-        await interaction.deferReply({ flags: 64 });
-        const all = Object.values(keys), active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)), paused = all.filter(k => k.paused), lt = all.filter(k => k.expiry === Infinity), online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS);
-        const pendentes = await PendingPayment.countDocuments(), totalVendas = await SaleHistory.aggregate([{ $group: { _id: null, total: { $sum: "$price" } } }]);
-        await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("📊 Stats").setColor(COLORS.primary).addFields({ name: "🔑 Total", value: `\`${all.length}\``, inline: true },{ name: "✅ Ativas", value: `\`${active.length}\``, inline: true },{ name: "⏸️ Pausadas", value: `\`${paused.length}\``, inline: true },{ name: "♾️ Lifetime", value: `\`${lt.length}\``, inline: true },{ name: "🟢 Online", value: `\`${online.length}\``, inline: true },{ name: "⏳ Pendentes", value: `\`${pendentes}\``, inline: true },{ name: "💰 Receita", value: `\`R$${totalVendas[0]?.total || 0}\``, inline: true }).setTimestamp()] }); return;
-    }
+    if (id === "logs_stats") { await interaction.deferReply({ flags: 64 }); const all = Object.values(keys).filter(k => !k.isAutoKey || k.remaining > 0), active = all.filter(k => !k.paused && (k.expiry === Infinity || k.expiry - Date.now() > 0)), paused = all.filter(k => k.paused), lt = all.filter(k => k.expiry === Infinity), online = Object.values(presence).filter(p => Date.now() - p.lastSeen < ONLINE_STALE_MS); const pendentes = await PendingPayment.countDocuments(), totalVendas = await SaleHistory.aggregate([{ $group: { _id: null, total: { $sum: "$price" } } }]); await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("📊 Stats").setColor(COLORS.primary).addFields({ name: "🔑 Total", value: `\`${all.length}\``, inline: true },{ name: "✅ Ativas", value: `\`${active.length}\``, inline: true },{ name: "⏸️ Pausadas", value: `\`${paused.length}\``, inline: true },{ name: "♾️ Lifetime", value: `\`${lt.length}\``, inline: true },{ name: "🟢 Online", value: `\`${online.length}\``, inline: true },{ name: "⏳ Pendentes", value: `\`${pendentes}\``, inline: true },{ name: "💰 Receita", value: `\`R$${totalVendas[0]?.total || 0}\``, inline: true }).setTimestamp()] }); return; }
     if (id === "logs_info") { await interaction.deferReply({ flags: 64 }); const ks = Object.keys(keys); if (!ks.length) { await interaction.editReply({ content: "Nenhuma key." }); return; } const now = Date.now(); await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("🔑 Keys").setColor(COLORS.primary).setDescription(ks.map(k => { const d = keys[k], t = d.paused ? d.remaining : (d.expiry === Infinity ? Infinity : d.expiry - now); return `• \`${k}\`: \`${formatTime(t)}\` ${d.paused ? "⏸️" : "✅"} ${d.discordId ? `<@${d.discordId}>` : ""}`; }).join("\n").substring(0, 4000)).setTimestamp()] }); return; }
     if (id === "logs_jobids") { await interaction.deferReply({ flags: 64 }); const entries = Object.entries(userJobIds); if (!entries.length) { await interaction.editReply({ content: "Nenhum JobID." }); return; } await interaction.editReply({ content: "🎮 **JobIDs:**\n" + entries.map(([n, j]) => `• **${n}**: \`${j}\``).join("\n") }); return; }
     if (id === "logs_blocked") { await interaction.deferReply({ flags: 64 }); const now = Date.now(), active = Object.entries(blockedIPs).filter(([, u]) => now < u); if (!active.length) { await interaction.editReply({ content: "Nenhum IP bloqueado." }); return; } await interaction.editReply({ content: "🔒 **IPs:**\n" + active.map(([ip, u]) => `• \`${ip}\` — ${Math.ceil((u - now) / 1000)}s`).join("\n") }); return; }
-    if (id === "logs_pendentes") {
-        await interaction.deferReply({ flags: 64 });
-        const pendentes = await PendingPayment.find().sort({ createdAt: -1 }); if (!pendentes.length) { await interaction.editReply({ content: "✅ Nenhum pendente!" }); return; }
-        const now = Date.now(); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.warning).setTitle(`⏳ Pendentes (${pendentes.length})`).setDescription(pendentes.map(p => { const rem = PENDING_EXPIRY_MS - (now - new Date(p.createdAt).getTime()); return `• **${p.discordTag}** — ${p.label} R$${p.finalPrice || p.price} — ⏳ ${rem > 0 ? formatTimeShort(rem) : "expirando..."}`; }).join("\n")).setTimestamp()] }); return;
-    }
+    if (id === "logs_pendentes") { await interaction.deferReply({ flags: 64 }); const pendentes = await PendingPayment.find().sort({ createdAt: -1 }); if (!pendentes.length) { await interaction.editReply({ content: "✅ Nenhum pendente!" }); return; } const now = Date.now(); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.warning).setTitle(`⏳ Pendentes (${pendentes.length})`).setDescription(pendentes.map(p => { const rem = PENDING_EXPIRY_MS - (now - new Date(p.createdAt).getTime()); return `• **${p.discordTag}** — ${p.label} R$${p.finalPrice || p.price} — ⏳ ${rem > 0 ? formatTimeShort(rem) : "expirando..."}`; }).join("\n")).setTimestamp()] }); return; }
     if (id === "logs_confirmar_manual") { await interaction.showModal(new ModalBuilder().setCustomId("modal_pay_confirm").setTitle("Confirmar Pagamento").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user_id").setLabel("ID Discord:").setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("horas").setLabel("Horas:").setStyle(TextInputStyle.Short).setRequired(true)))); return; }
     if (id === "logs_cancelar_pedido") { await interaction.showModal(new ModalBuilder().setCustomId("modal_cancel_pedido").setTitle("Cancelar Pedido").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user_id").setLabel("ID Discord:").setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("motivo").setLabel("Motivo:").setStyle(TextInputStyle.Short).setRequired(false)))); return; }
     if (id === "logs_vendas") { await interaction.deferReply({ flags: 64 }); const sales = await SaleHistory.find().sort({ confirmedAt: -1 }), totalR = sales.reduce((a, s) => a + (s.price || 0), 0), hoje = sales.filter(s => new Date(s.confirmedAt).toDateString() === new Date().toDateString()), hojeR = hoje.reduce((a, s) => a + (s.price || 0), 0); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("💰 Vendas").addFields({ name: "📦 Total", value: `\`${sales.length}\``, inline: true },{ name: "💰 Receita", value: `\`R$${totalR}\``, inline: true },{ name: "📅 Hoje", value: `\`${hoje.length}\``, inline: true },{ name: "💵 Hoje R$", value: `\`R$${hojeR}\``, inline: true }).setTimestamp()] }); return; }
@@ -629,10 +711,7 @@ clientLogs.on("messageCreate", async (message) => {
     if (message.author.bot) return;
     if (message.content === "!logspanel") await sendLogsPanel();
     if (message.content === "!online") {
-        try {
-            const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] });
-            startOnlineInterval(message.channel.id, msg);
-        } catch (e) { console.error("[!online]", e.message); }
+        try { const msg = await message.channel.send({ embeds: [buildOnlineEmbed()] }); startOnlineInterval(message.channel.id, msg); } catch (e) { console.error("[!online]", e.message); }
     }
 });
 
@@ -686,30 +765,11 @@ clientPayment.on("ready", async () => {
 clientPayment.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton() && !interaction.isModalSubmit()) return;
     const id = interaction.customId, user = interaction.user;
-    if (interaction.isModalSubmit() && id === "modal_cupom") {
-        await interaction.deferReply({ flags: 64 });
-        const planValue = pendingCoupon[user.id]?.plan, couponCode = interaction.fields.getTextInputValue("coupon_code").trim().toUpperCase();
-        const plan = getActivePlans().find(p => p.value === planValue);
-        if (!plan) { await interaction.editReply({ content: "❌ Sessão expirada." }); return; }
-        const result = await applyCoupon(couponCode, user.id, plan.price);
-        if (!result.ok) { await interaction.editReply({ content: result.msg }); return; }
-        pendingCoupon[user.id] = { plan: planValue, coupon: couponCode, finalPrice: result.finalPrice };
-        await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎟️ Cupom Aplicado!").setDescription(`**${couponCode}** — ${result.discount}${result.type === "percent" ? "%" : " R$"} off\n**Preço final: R$${result.finalPrice}**`).setTimestamp()] }); return;
-    }
+    if (interaction.isModalSubmit() && id === "modal_cupom") { await interaction.deferReply({ flags: 64 }); const planValue = pendingCoupon[user.id]?.plan, couponCode = interaction.fields.getTextInputValue("coupon_code").trim().toUpperCase(); const plan = getActivePlans().find(p => p.value === planValue); if (!plan) { await interaction.editReply({ content: "❌ Sessão expirada." }); return; } const result = await applyCoupon(couponCode, user.id, plan.price); if (!result.ok) { await interaction.editReply({ content: result.msg }); return; } pendingCoupon[user.id] = { plan: planValue, coupon: couponCode, finalPrice: result.finalPrice }; await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🎟️ Cupom Aplicado!").setDescription(`**${couponCode}** — ${result.discount}${result.type === "percent" ? "%" : " R$"} off\n**Preço final: R$${result.finalPrice}**`).setTimestamp()] }); return; }
     if (!interaction.isButton()) return;
     await interaction.deferReply({ flags: 64 });
     if (id === "buy_cupom") { await interaction.deleteReply().catch(() => {}); await interaction.showModal(new ModalBuilder().setCustomId("modal_cupom").setTitle("🎟️ Cupom").addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("coupon_code").setLabel("Código:").setStyle(TextInputStyle.Short).setRequired(true)))); return; }
-    if (id.startsWith("buy_") && id !== "buy_minhakey") {
-        const planValue = id.replace("buy_", ""), plan = getActivePlans().find(p => p.value === planValue);
-        if (!plan) { await interaction.editReply({ content: "❌ Plano inválido!" }); return; }
-        const existing = await PendingPayment.findOne({ discordId: user.id }); const now = Date.now();
-        if (existing) { const rem = PENDING_EXPIRY_MS - (now - new Date(existing.createdAt).getTime()); if (rem > 0) { await interaction.editReply({ content: `⚠️ Pedido ativo! Expira em **${formatTimeShort(rem)}**.` }); return; } }
-        const couponData = pendingCoupon[user.id]?.plan === planValue ? pendingCoupon[user.id] : null;
-        let finalPrice = plan.price, couponUsed = null;
-        if (couponData) { finalPrice = couponData.finalPrice; couponUsed = couponData.coupon; delete pendingCoupon[user.id]; }
-        await PendingPayment.findOneAndUpdate({ discordId: user.id }, { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, finalPrice, label: plan.label, couponUsed, warningSent: false, createdAt: new Date() }, { upsert: true, new: true });
-        await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle("💳 Pix").setDescription(`**${plan.emoji} ${plan.label}** — R$${finalPrice},00\n\n**Chave Pix:**\n\`\`\`${PIX_KEY}\`\`\`**Nome:** ${PIX_NAME}\n\n> Envie o comprovante aqui!\n> ⏳ **15 minutos** para pagar.`).setTimestamp()] }); return;
-    }
+    if (id.startsWith("buy_") && id !== "buy_minhakey") { const planValue = id.replace("buy_", ""), plan = getActivePlans().find(p => p.value === planValue); if (!plan) { await interaction.editReply({ content: "❌ Plano inválido!" }); return; } const existing = await PendingPayment.findOne({ discordId: user.id }); const now = Date.now(); if (existing) { const rem = PENDING_EXPIRY_MS - (now - new Date(existing.createdAt).getTime()); if (rem > 0) { await interaction.editReply({ content: `⚠️ Pedido ativo! Expira em **${formatTimeShort(rem)}**.` }); return; } } const couponData = pendingCoupon[user.id]?.plan === planValue ? pendingCoupon[user.id] : null; let finalPrice = plan.price, couponUsed = null; if (couponData) { finalPrice = couponData.finalPrice; couponUsed = couponData.coupon; delete pendingCoupon[user.id]; } await PendingPayment.findOneAndUpdate({ discordId: user.id }, { discordId: user.id, discordTag: user.tag, hours: plan.hours, price: plan.price, finalPrice, label: plan.label, couponUsed, warningSent: false, createdAt: new Date() }, { upsert: true, new: true }); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle("💳 Pix").setDescription(`**${plan.emoji} ${plan.label}** — R$${finalPrice},00\n\n**Chave Pix:**\n\`\`\`${PIX_KEY}\`\`\`**Nome:** ${PIX_NAME}\n\n> Envie o comprovante aqui!\n> ⏳ **15 minutos** para pagar.`).setTimestamp()] }); return; }
     if (id === "buy_minhakey") { const userKeys = Object.entries(keys).filter(([, d]) => d.discordId === user.id); if (!userKeys.length) { await interaction.editReply({ content: "❌ Nenhuma key!" }); return; } const now = Date.now(); await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle("🔑 Suas Keys").setDescription(userKeys.map(([k, d]) => `\`${k}\` — ${d.expiry === Infinity ? "Lifetime ♾️" : (d.expiry - now > 0 ? formatTime(d.expiry - now) : "❌")} ${d.paused ? "⏸️" : "✅"}`).join("\n")).setTimestamp()] }); return; }
 });
 
