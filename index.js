@@ -65,7 +65,7 @@ const REDIRECT_URI           = `${process.env.RAILWAY_PUBLIC_DOMAIN ? "https://"
 
 const ADMIN_ROLE_IDS = ["1477885793144930496","1501356382677373101","1477885797553148066"];
 const RECHARGE_CHANNEL = "1511517095412895905";
-const MIN_RECHARGE = 5;
+const MIN_RECHARGE = 10;
 
 const DEFAULT_PLANS = [
     { label: "1 Hora",   value: "1h",  price: 5,  hours: 1,  emoji: "🕐", active: true },
